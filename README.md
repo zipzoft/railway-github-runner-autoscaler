@@ -7,7 +7,7 @@ Fix high memory usage and runners not picking up new jobs — a lightweight auto
 ```
 GitHub Actions
      │
-     │  POST /webhook (workflow_job.queued / .completed)
+     │  POST /webhook (workflow_job.queued / .in_progress / .completed)
      ▼
 ┌─────────────────────┐
 │  autoscaler service │  ← always on, 1 replica
@@ -36,11 +36,11 @@ This autoscaler listens for GitHub `workflow_job` webhook events and automatical
 
 ## How It Works
 
-- The runner service always keeps **1 replica running**, ready to pick up jobs immediately.
-- When a job is queued, the autoscaler increments its counter. The base replica handles the first job with no API call needed.
-- For concurrent jobs, the autoscaler calls `setReplicas(N)` to add more replicas.
-- When a job completes, the autoscaler decrements its counter but **does not scale down immediately** — Railway's API can only set a desired replica count and cannot target a specific replica for removal. Terminating a random one risks canceling an in-flight job.
-- Once **all jobs are complete**, the autoscaler resets to 1 replica via the Railway API.
+The autoscaler tracks each job by its GitHub job ID across three states: queued, in-progress, and complete.
+
+- **`queued`** — job ID is added to the queued set. If this is the first job, the base replica handles it with no API call. For concurrent jobs, `setReplicas(N)` is called to add more replicas. Jobs above `MAX_RUNNERS` are tracked but wait for the current batch to finish.
+- **`in_progress`** — job ID moves from queued to in-progress. No scaling call is made — a replica is already running for it.
+- **`completed`** — job ID is removed from in-progress. If other jobs are still in-progress, replicas are left unchanged. Once **all in-progress jobs are done**, the autoscaler calls `setReplicas` — either to pick up any remaining queued jobs, or to reset back to 1 replica if everything is complete.
 
 > **Note:** This approach is best suited for projects with infrequent or bursty CI workloads. The base replica stays running at all times (consuming minimal memory while idle), scaling up for concurrent jobs and resetting back to 1 when all jobs are done. If your runners are consistently running many concurrent jobs, consider adjusting `MAX_RUNNERS` accordingly.
 

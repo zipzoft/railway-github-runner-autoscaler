@@ -27,8 +27,9 @@ type Config struct {
 }
 
 type State struct {
-	mu    sync.Mutex
-	count int
+	mu         sync.Mutex
+	queued     map[int64]struct{}
+	inProgress map[int64]struct{}
 }
 
 type Server struct {
@@ -93,13 +94,15 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	srv := &Server{cfg: cfg, state: &State{}}
+	srv := &Server{cfg: cfg, state: &State{
+		queued:     make(map[int64]struct{}),
+		inProgress: make(map[int64]struct{}),
+	}}
 
-	log.Printf("startup: counter initialised to 0, base replica ready for jobs")
+	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", srv.handleWebhook)
-	mux.HandleFunc("/sync", srv.handleSync)
 	mux.HandleFunc("/health", srv.handleHealth)
 
 	log.Printf("starting on :%s | service=%s max=%d labels=%v",

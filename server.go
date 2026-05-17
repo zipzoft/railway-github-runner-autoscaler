@@ -25,6 +25,7 @@ type WorkflowJobEvent struct {
 }
 
 type WorkflowJob struct {
+	ID     int64    `json:"id"`
 	Labels []string `json:"labels"`
 }
 
@@ -39,19 +40,6 @@ type gqlResponse struct {
 		Message string `json:"message"`
 	} `json:"errors"`
 }
-
-type getReplResponse struct {
-	Service struct {
-		ServiceInstances struct {
-			Edges []struct {
-				Node struct {
-					NumReplicas int `json:"numReplicas"`
-				} `json:"node"`
-			} `json:"edges"`
-		} `json:"serviceInstances"`
-	} `json:"service"`
-}
-
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -96,15 +84,18 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("webhook received: action=%s labels=%v", event.Action, event.WorkflowJob.Labels)
 
+	id := event.WorkflowJob.ID
 	switch event.Action {
 	case "queued":
-		if err := s.scaleUp(r.Context()); err != nil {
+		if err := s.scaleUp(r.Context(), id); err != nil {
 			log.Printf("scale up error: %v", err)
 			http.Error(w, "failed to scale up", http.StatusInternalServerError)
 			return
 		}
+	case "in_progress":
+		s.markInProgress(id)
 	case "completed":
-		if err := s.scaleDown(r.Context()); err != nil {
+		if err := s.scaleDown(r.Context(), id); err != nil {
 			log.Printf("scale down error: %v", err)
 			http.Error(w, "failed to scale down", http.StatusInternalServerError)
 			return
@@ -114,28 +105,6 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-}
-
-func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	actual, err := s.getReplicas(r.Context())
-	if err != nil {
-		log.Printf("sync error: %v", err)
-		http.Error(w, `{"error":"failed to query Railway"}`, http.StatusBadGateway)
-		return
-	}
-
-	s.state.mu.Lock()
-	s.state.count = actual
-	s.state.mu.Unlock()
-
-	log.Printf("synced: replicas=%d", actual)
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"replicas":%d,"synced":true}`, actual)
 }
 
 func validateHMAC(body []byte, sigHeader, secret string) bool {
@@ -166,60 +135,66 @@ func hasLabels(jobLabels, required []string) bool {
 	return true
 }
 
-func (s *Server) scaleUp(ctx context.Context) error {
+func (s *Server) markInProgress(id int64) {
 	s.state.mu.Lock()
-	newCount := s.state.count + 1
-	if newCount > s.cfg.MaxRunners {
-		s.state.mu.Unlock()
-		log.Printf("at max runners (%d), not scaling up", s.cfg.MaxRunners)
-		return nil
-	}
-	s.state.count = newCount
+	delete(s.state.queued, id)
+	s.state.inProgress[id] = struct{}{}
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
+	s.state.mu.Unlock()
+	log.Printf("job in progress: id=%d queued=%d inProgress=%d", id, queued, inProgress)
+}
+
+func (s *Server) scaleUp(ctx context.Context, id int64) error {
+	s.state.mu.Lock()
+	s.state.queued[id] = struct{}{}
+	total := len(s.state.queued) + len(s.state.inProgress)
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
 
-	if newCount == 1 {
-		// Base replica is already running — no API call needed.
-		log.Printf("scaled up: replicas=1 (base replica handles first job)")
+	if total == 1 {
+		log.Printf("scaled up: replicas=1 (base replica handles first job, id=%d)", id)
 		return nil
 	}
 
-	if err := s.setReplicas(ctx, newCount); err != nil {
-		s.state.mu.Lock()
-		s.state.count--
-		s.state.mu.Unlock()
+	if total > s.cfg.MaxRunners {
+		log.Printf("at max runners (%d), job %d queued and waiting (queued=%d inProgress=%d)",
+			s.cfg.MaxRunners, id, queued, inProgress)
+		return nil
+	}
+
+	if err := s.setReplicas(ctx, total); err != nil {
 		return err
 	}
-	log.Printf("scaled up: replicas=%d", newCount)
+	log.Printf("scaled up: replicas=%d (job id=%d)", total, id)
 	return nil
 }
 
-func (s *Server) scaleDown(ctx context.Context) error {
+func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
-	prev := s.state.count
-	newCount := prev - 1
-	if newCount < 0 {
-		newCount = 0
-	}
-	s.state.count = newCount
+	delete(s.state.inProgress, id)
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
 
-	if prev == 0 {
-		log.Printf("scaled down: already at 0, ignoring")
+	if inProgress > 0 {
+		// Decreasing the replicas while jobs are still in progress can cause them to be killed before completion, so we wait until all in-progress jobs are done before scaling down.
+		log.Printf("scaled down: job %d complete, queued=%d inProgress=%d, replicas unchanged", id, queued, inProgress)
 		return nil
 	}
 
-	if newCount == 0 {
-		if err := s.setReplicas(ctx, 1); err != nil {
-			s.state.mu.Lock()
-			s.state.count++
-			s.state.mu.Unlock()
-			return err
-		}
+	next := max(1, min(queued, s.cfg.MaxRunners))
+
+	if err := s.setReplicas(ctx, next); err != nil {
+		return err
+	}
+
+	if queued == 0 {
 		log.Printf("scaled down: all jobs complete, reset to 1 replica")
-		return nil
+	} else {
+		log.Printf("scaled down: in-progress batch done, resuming %d pending job(s) with %d replica(s)", queued, next)
 	}
-
-	log.Printf("scaled down: %d job(s) still running", newCount)
 	return nil
 }
 
@@ -236,27 +211,6 @@ mutation UpdateReplicas($serviceId: String!, $environmentId: String!, $input: Se
 			"input":         map[string]any{"numReplicas": n},
 		},
 	}, nil)
-}
-
-func (s *Server) getReplicas(ctx context.Context) (int, error) {
-	const query = `
-query GetReplicas($serviceId: String!) {
-  service(id: $serviceId) {
-    serviceInstances { edges { node { numReplicas } } }
-  }
-}`
-	var data getReplResponse
-	if err := s.gqlDo(ctx, gqlRequest{
-		Query:     query,
-		Variables: map[string]any{"serviceId": s.cfg.ServiceID},
-	}, &data); err != nil {
-		return 0, err
-	}
-	edges := data.Service.ServiceInstances.Edges
-	if len(edges) == 0 {
-		return 0, nil
-	}
-	return edges[0].Node.NumReplicas, nil
 }
 
 func (s *Server) gqlDo(ctx context.Context, req gqlRequest, out any) error {
