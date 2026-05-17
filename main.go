@@ -30,6 +30,7 @@ type State struct {
 	mu         sync.Mutex
 	queued     map[int64]struct{}
 	inProgress map[int64]struct{}
+	completed  map[int64]struct{}
 }
 
 type Server struct {
@@ -97,6 +98,7 @@ func main() {
 	srv := &Server{cfg: cfg, state: &State{
 		queued:     make(map[int64]struct{}),
 		inProgress: make(map[int64]struct{}),
+		completed:  make(map[int64]struct{}),
 	}}
 
 	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready")

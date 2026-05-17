@@ -148,9 +148,10 @@ func (s *Server) markInProgress(id int64) {
 func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
 	s.state.queued[id] = struct{}{}
-	total := len(s.state.queued) + len(s.state.inProgress)
+	total := len(s.state.queued) + len(s.state.inProgress) + len(s.state.completed)
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
+	completed := len(s.state.completed)
 	s.state.mu.Unlock()
 
 	if total == 1 {
@@ -159,21 +160,22 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	}
 
 	if total > s.cfg.MaxRunners {
-		log.Printf("at max runners (%d), job %d queued and waiting (queued=%d inProgress=%d)",
-			s.cfg.MaxRunners, id, queued, inProgress)
+		log.Printf("at max runners (%d), job %d queued and waiting (queued=%d inProgress=%d completed=%d)",
+			s.cfg.MaxRunners, id, queued, inProgress, completed)
 		return nil
 	}
 
 	if err := s.setReplicas(ctx, total); err != nil {
 		return err
 	}
-	log.Printf("scaled up: replicas=%d (job id=%d)", total, id)
+	log.Printf("scaled up: replicas=%d (job id=%d, queued=%d inProgress=%d completed=%d)", total, id, queued, inProgress, completed)
 	return nil
 }
 
 func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
 	delete(s.state.inProgress, id)
+	s.state.completed[id] = struct{}{}
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
@@ -185,10 +187,14 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	}
 
 	next := max(1, min(queued, s.cfg.MaxRunners))
-
 	if err := s.setReplicas(ctx, next); err != nil {
 		return err
 	}
+
+	// completed jobs are no longer using up inactive replicas we need to count for
+	s.state.mu.Lock()
+	s.state.completed = make(map[int64]struct{})
+	s.state.mu.Unlock()
 
 	if queued == 0 {
 		log.Printf("scaled down: all jobs complete, reset to 1 replica")
