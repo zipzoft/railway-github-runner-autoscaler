@@ -134,9 +134,10 @@ func main() {
 
 	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready, staleJobTTL=%s", cfg.StaleJobTTL)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.reapLoop(ctx)
+	// No shutdown path cancels this: ListenAndServe below never returns until a
+	// fatal error, and log.Fatalf exits the process immediately (skipping
+	// defers), so the process exit itself is what ends this goroutine.
+	go srv.reapLoop(context.Background())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", srv.handleWebhook)

@@ -431,3 +431,34 @@ func TestReapStaleJobs_DoesNotTouchReplicasWhileOtherJobInProgress(t *testing.T)
 		t.Fatalf("reap must not touch replicas while a real job (1) is still in progress")
 	}
 }
+
+// TestReapStaleJobs_PurgesStaleInProgressEntryButKeepsFreshOne pins that the
+// reap loop over inProgress evaluates each entry independently: a stale
+// in-progress entry (e.g. its completed webhook was lost) is purged even
+// while a different, genuinely fresh in-progress job is left untouched and
+// still blocks any replica change.
+func TestReapStaleJobs_PurgesStaleInProgressEntryButKeepsFreshOne(t *testing.T) {
+	srv, client := newTestServer(6, time.Hour, testClock)
+	ctx := context.Background()
+
+	srv.state.mu.Lock()
+	srv.state.inProgress[1] = testClock()                     // fresh: just started
+	srv.state.inProgress[2] = testClock().Add(-2 * time.Hour) // stale: past the 1h TTL
+	srv.state.mu.Unlock()
+
+	srv.reapStaleJobs(ctx)
+
+	srv.state.mu.Lock()
+	_, job1Present := srv.state.inProgress[1]
+	_, job2Present := srv.state.inProgress[2]
+	srv.state.mu.Unlock()
+	if !job1Present {
+		t.Fatalf("fresh job 1 should not have been reaped")
+	}
+	if job2Present {
+		t.Fatalf("expected stale job 2 to be reaped from inProgress")
+	}
+	if _, ok := client.lastCall(); ok {
+		t.Fatalf("reap must not touch replicas while job 1 is still genuinely in progress")
+	}
+}
