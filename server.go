@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -95,6 +96,10 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case "in_progress":
 		s.markInProgress(id)
 	case "completed":
+		// completed is GitHub's only terminal workflow_job action: it fires whether
+		// the job ran to completion, failed, or was cancelled before ever starting
+		// (e.g. superseded by concurrency.cancel-in-progress). scaleDown must retire
+		// the id from every in-flight set here, since no other event will.
 		if err := s.scaleDown(r.Context(), id); err != nil {
 			log.Printf("scale down error: %v", err)
 			http.Error(w, "failed to scale down", http.StatusInternalServerError)
@@ -138,7 +143,7 @@ func hasLabels(jobLabels, required []string) bool {
 func (s *Server) markInProgress(id int64) {
 	s.state.mu.Lock()
 	delete(s.state.queued, id)
-	s.state.inProgress[id] = struct{}{}
+	s.state.inProgress[id] = s.clock()
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
@@ -147,7 +152,7 @@ func (s *Server) markInProgress(id int64) {
 
 func (s *Server) scaleUp(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
-	s.state.queued[id] = struct{}{}
+	s.state.queued[id] = s.clock()
 	total := len(s.state.queued) + len(s.state.inProgress) + len(s.state.completed)
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
@@ -165,7 +170,7 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	if err := s.setReplicas(ctx, total); err != nil {
+	if err := s.client.SetReplicas(ctx, total); err != nil {
 		return err
 	}
 	log.Printf("scaled up: replicas=%d (job id=%d, queued=%d inProgress=%d completed=%d)", total, id, queued, inProgress, completed)
@@ -174,6 +179,11 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 
 func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	s.state.mu.Lock()
+	// A job that is cancelled while still queued (e.g. superseded by
+	// concurrency.cancel-in-progress) never fires in_progress, so it must be
+	// retired from queued here too - otherwise its id is never removed from any
+	// set and the queued count leaks upward forever.
+	delete(s.state.queued, id)
 	delete(s.state.inProgress, id)
 	s.state.completed[id] = struct{}{}
 	queued := len(s.state.queued)
@@ -187,7 +197,7 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	}
 
 	next := max(1, min(queued, s.cfg.MaxRunners))
-	if err := s.setReplicas(ctx, next); err != nil {
+	if err := s.client.SetReplicas(ctx, next); err != nil {
 		return err
 	}
 
@@ -204,22 +214,104 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (s *Server) setReplicas(ctx context.Context, n int) error {
+// reapLoop periodically calls reapStaleJobs until ctx is cancelled.
+func (s *Server) reapLoop(ctx context.Context) {
+	ticker := time.NewTicker(reapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reapStaleJobs(ctx)
+		}
+	}
+}
+
+// reapStaleJobs is a defense-in-depth safety net, not the primary leak fix
+// (that's the delete-from-queued-in-scaleDown change above). It protects
+// against a webhook delivery that is lost entirely - e.g. GitHub retries
+// exhausted while the service was down - which would otherwise leak an id
+// forever with no terminal event to clean it up. Any queued/inProgress entry
+// older than cfg.StaleJobTTL is treated as abandoned and purged; the TTL
+// default (6h) is far beyond any realistic job duration on this fleet so it
+// never fires during normal operation.
+func (s *Server) reapStaleJobs(ctx context.Context) {
+	now := s.clock()
+	s.state.mu.Lock()
+	var reaped []int64
+	for id, t := range s.state.queued {
+		if now.Sub(t) > s.cfg.StaleJobTTL {
+			delete(s.state.queued, id)
+			reaped = append(reaped, id)
+		}
+	}
+	for id, t := range s.state.inProgress {
+		if now.Sub(t) > s.cfg.StaleJobTTL {
+			delete(s.state.inProgress, id)
+			reaped = append(reaped, id)
+		}
+	}
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
+	s.state.mu.Unlock()
+
+	if len(reaped) == 0 {
+		return
+	}
+	log.Printf("reaped %d stale job id(s), no terminal webhook received within %s: %v", len(reaped), s.cfg.StaleJobTTL, reaped)
+
+	if inProgress > 0 {
+		// still real work tracked as in-flight; leave replicas alone
+		return
+	}
+
+	next := max(1, min(queued, s.cfg.MaxRunners))
+	if err := s.client.SetReplicas(ctx, next); err != nil {
+		log.Printf("reap: scale error: %v", err)
+		return
+	}
+
+	s.state.mu.Lock()
+	s.state.completed = make(map[int64]struct{})
+	s.state.mu.Unlock()
+	log.Printf("reap: replicas set to %d after stale-job cleanup (queued=%d)", next, queued)
+}
+
+// railwayClient is the production RailwayClient: it calls Railway's GraphQL
+// API using a project-scoped access token.
+type railwayClient struct {
+	token         string
+	serviceID     string
+	environmentID string
+	httpClient    *http.Client
+}
+
+func newRailwayClient(cfg Config) *railwayClient {
+	return &railwayClient{
+		token:         cfg.RailwayToken,
+		serviceID:     cfg.ServiceID,
+		environmentID: cfg.EnvironmentID,
+		httpClient:    http.DefaultClient,
+	}
+}
+
+func (c *railwayClient) SetReplicas(ctx context.Context, n int) error {
 	const mutation = `
 mutation UpdateReplicas($serviceId: String!, $environmentId: String!, $input: ServiceInstanceUpdateInput!) {
   serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input)
 }`
-	return s.gqlDo(ctx, gqlRequest{
+	return c.gqlDo(ctx, gqlRequest{
 		Query: mutation,
 		Variables: map[string]any{
-			"serviceId":     s.cfg.ServiceID,
-			"environmentId": s.cfg.EnvironmentID,
+			"serviceId":     c.serviceID,
+			"environmentId": c.environmentID,
 			"input":         map[string]any{"numReplicas": n},
 		},
 	}, nil)
 }
 
-func (s *Server) gqlDo(ctx context.Context, req gqlRequest, out any) error {
+func (c *railwayClient) gqlDo(ctx context.Context, req gqlRequest, out any) error {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
@@ -230,9 +322,12 @@ func (s *Server) gqlDo(ctx context.Context, req gqlRequest, out any) error {
 		return fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.cfg.RailwayToken)
+	// Project-scoped Railway tokens authenticate via Project-Access-Token, not
+	// Authorization: Bearer (that header is for account/workspace/OAuth tokens).
+	// This service is deployed with a project token - keep this header as-is.
+	httpReq.Header.Set("Project-Access-Token", c.token)
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("railway api: %w", err)
 	}
