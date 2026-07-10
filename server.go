@@ -147,6 +147,17 @@ func hasLabels(jobLabels, required []string) bool {
 
 func (s *Server) markInProgress(id int64) {
 	s.state.mu.Lock()
+	if _, queued := s.state.queued[id]; !queued {
+		// in_progress only legitimately follows a queued we recorded. If the id
+		// isn't queued it's a late, duplicate, or out-of-order delivery - most
+		// importantly an in_progress retried after the job already completed and
+		// the batch settled (which clears completed). Ignore it rather than
+		// resurrecting a phantom in-progress job that would inflate later counts
+		// until the TTL reaper cleans it up.
+		s.state.mu.Unlock()
+		log.Printf("in_progress ignored: job %d is not queued (late or out-of-order webhook)", id)
+		return
+	}
 	delete(s.state.queued, id)
 	s.state.inProgress[id] = s.clock()
 	queued := len(s.state.queued)

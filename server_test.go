@@ -269,6 +269,45 @@ func TestScaling_AppliersDoNotOverlap(t *testing.T) {
 	}
 }
 
+func TestMarkInProgress_IgnoresJobNotQueued(t *testing.T) {
+	srv, _ := newTestServer(6, time.Hour, testClock)
+	srv.markInProgress(999) // never queued
+
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[999]
+	srv.state.mu.Unlock()
+	if present {
+		t.Fatal("in_progress for a job that was never queued must not be injected into inProgress")
+	}
+}
+
+// TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject reproduces the
+// out-of-order delivery the guard exists for: a retried in_progress arrives
+// after the job already completed and the batch settled (which clears the
+// completed set). The id must stay out of inProgress, not leak until the reaper.
+func TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject(t *testing.T) {
+	srv, _ := newTestServer(6, time.Hour, testClock)
+	ctx := context.Background()
+
+	if err := srv.scaleUp(ctx, 100); err != nil {
+		t.Fatalf("scaleUp(100): %v", err)
+	}
+	srv.markInProgress(100)
+	if err := srv.scaleDown(ctx, 100); err != nil { // completes; batch settles; state empty
+		t.Fatalf("scaleDown(100): %v", err)
+	}
+
+	srv.markInProgress(100) // late/retried in_progress for the finished job
+
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[100]
+	n := len(srv.state.inProgress)
+	srv.state.mu.Unlock()
+	if present || n != 0 {
+		t.Fatalf("late in_progress re-injected completed job 100 (inProgress size=%d)", n)
+	}
+}
+
 // --- regression coverage for the queued-counter leak ---
 
 // TestScaleDown_CancelledWhileQueued_DoesNotLeak reproduces the production
