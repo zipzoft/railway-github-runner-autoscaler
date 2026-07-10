@@ -73,6 +73,24 @@ func newTestServer(maxRunners int, ttl time.Duration, clock func() time.Time) (*
 	return srv, client
 }
 
+// postWebhook signs and delivers a workflow_job webhook through the real
+// handler, so tests exercise the JSON decode + HMAC path, not just the
+// internal state methods.
+func postWebhook(srv *Server, action string, id int64) *httptest.ResponseRecorder {
+	payload := fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"labels":["self-hosted","railway"]}}`, action, id)
+	body := []byte(payload)
+	mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
+	mac.Write(body)
+	sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	srv.handleWebhook(rec, req)
+	return rec
+}
+
 // --- pure helper functions ---
 
 func TestHasLabels(t *testing.T) {
@@ -307,18 +325,7 @@ func TestHandleWebhook_QueuedThenCancelledDoesNotLeak(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
 
 	send := func(action string, id int64) *httptest.ResponseRecorder {
-		payload := fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"labels":["self-hosted","railway"]}}`, action, id)
-		body := []byte(payload)
-		mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
-		mac.Write(body)
-		sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-
-		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
-		req.Header.Set("X-GitHub-Event", "workflow_job")
-		req.Header.Set("X-Hub-Signature-256", sig)
-		rec := httptest.NewRecorder()
-		srv.handleWebhook(rec, req)
-		return rec
+		return postWebhook(srv, action, id)
 	}
 
 	if rec := send("queued", 1); rec.Code != http.StatusOK {
