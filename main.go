@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -121,6 +124,9 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	srv := &Server{
 		cfg: cfg,
 		state: &State{
@@ -132,19 +138,59 @@ func main() {
 		clock:  time.Now,
 	}
 
+	// In-memory state starts empty on every boot and is deliberately not
+	// reconciled against Railway's live replica count: after a mid-batch restart
+	// the service can't tell an idle replica from one running a job, so forcing a
+	// reset would kill in-flight runners. The next completed batch settles the
+	// count back to 1 (see scaleDown); an orphaned high count with no further
+	// jobs only costs idle memory.
 	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready, staleJobTTL=%s", cfg.StaleJobTTL)
 
-	// No shutdown path cancels this: ListenAndServe below never returns until a
-	// fatal error, and log.Fatalf exits the process immediately (skipping
-	// defers), so the process exit itself is what ends this goroutine.
-	go srv.reapLoop(context.Background())
+	// reapLoop stops when ctx is cancelled by SIGINT/SIGTERM, the same signal
+	// that drives the graceful HTTP shutdown below.
+	go srv.reapLoop(ctx)
 
 	httpSrv := newHTTPServer(":"+cfg.Port, srv)
 
 	log.Printf("starting on :%s | service=%s max=%d labels=%v",
 		cfg.Port, cfg.ServiceID, cfg.MaxRunners, cfg.RunnerLabels)
-	if err := httpSrv.ListenAndServe(); err != nil {
+	if err := serve(ctx, httpSrv); err != nil {
 		log.Fatalf("server error: %v", err)
+	}
+	log.Printf("shutdown complete")
+}
+
+// serve runs httpSrv until ctx is cancelled, then drains in-flight requests via
+// a bounded graceful shutdown. It binds httpSrv.Addr and delegates to
+// serveListener so the shutdown behaviour is testable against a real listener.
+func serve(ctx context.Context, httpSrv *http.Server) error {
+	ln, err := net.Listen("tcp", httpSrv.Addr)
+	if err != nil {
+		return err
+	}
+	return serveListener(ctx, httpSrv, ln)
+}
+
+// serveListener serves on ln until ctx is cancelled, then calls Shutdown to let
+// in-flight requests finish (bounded by a 15s deadline). It returns nil on a
+// clean shutdown; a mid-flight bind/serve failure is returned as-is.
+func serveListener(ctx context.Context, httpSrv *http.Server, ln net.Listener) error {
+	errCh := make(chan error, 1)
+	go func() {
+		err := httpSrv.Serve(ln)
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return httpSrv.Shutdown(shutdownCtx)
 	}
 }
 
