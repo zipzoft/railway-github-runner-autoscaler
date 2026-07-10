@@ -149,7 +149,9 @@ func main() {
 	// the service can't tell an idle replica from one running a job, so forcing a
 	// reset would kill in-flight runners. The next completed batch settles the
 	// count back to 1 (see scaleDown); an orphaned high count with no further
-	// jobs only costs idle memory.
+	// jobs only costs idle memory. For the same reason, an in_progress webhook
+	// for a job whose queued entry was lost on restart is ignored (see
+	// markInProgress), leaving that job untracked until it completes.
 	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready, staleJobTTL=%s", cfg.StaleJobTTL)
 
 	// reapLoop stops when ctx is cancelled by SIGINT/SIGTERM, the same signal
@@ -212,7 +214,10 @@ func newHTTPServer(addr string, srv *Server) *http.Server {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Above the ~10s Railway client timeout the handler can block on while
+		// scaling synchronously, so a slow-but-successful scale still returns a
+		// client-visible 200 instead of a dropped write GitHub reads as a failure.
+		WriteTimeout: 20 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 }
