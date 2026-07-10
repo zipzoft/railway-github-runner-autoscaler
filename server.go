@@ -284,6 +284,7 @@ type railwayClient struct {
 	token         string
 	serviceID     string
 	environmentID string
+	baseURL       string
 	httpClient    *http.Client
 }
 
@@ -292,6 +293,7 @@ func newRailwayClient(cfg Config) *railwayClient {
 		token:         cfg.RailwayToken,
 		serviceID:     cfg.ServiceID,
 		environmentID: cfg.EnvironmentID,
+		baseURL:       railwayGQLURL,
 		httpClient:    http.DefaultClient,
 	}
 }
@@ -317,7 +319,7 @@ func (c *railwayClient) gqlDo(ctx context.Context, req gqlRequest, out any) erro
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, railwayGQLURL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
