@@ -242,6 +242,40 @@ func TestHandleWebhook_ValidationResponses(t *testing.T) {
 	})
 }
 
+// TestHandleWebhook_ScalingSurvivesRequestCancellation proves the scaling
+// side-effect no longer rides the request context: a webhook whose request
+// context is already cancelled must still scale. The fake honors ctx here, so
+// against the old code (which passed r.Context() into the scale call) the fake
+// would return a cancellation error and the handler would 500.
+func TestHandleWebhook_ScalingSurvivesRequestCancellation(t *testing.T) {
+	srv, client := newTestServer(6, time.Hour, testClock)
+	client.respectCtx = true
+
+	if rec := postWebhook(srv, "queued", 1); rec.Code != http.StatusOK { // base replica, no call
+		t.Fatalf("queued(1): status=%d", rec.Code)
+	}
+
+	body := []byte(`{"action":"queued","workflow_job":{"id":2,"labels":["self-hosted","railway"]}}`)
+	mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
+	mac.Write(body)
+	sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // request context cancelled before the handler runs
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	srv.handleWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with scaling completed despite cancellation, got %d body=%s", rec.Code, rec.Body)
+	}
+	if last, ok := client.lastCall(); !ok || last != 2 {
+		t.Fatalf("expected SetReplicas(2) despite request cancellation, got last=%d ok=%v", last, ok)
+	}
+}
+
 func TestHandleHealth(t *testing.T) {
 	srv, _ := newTestServer(6, time.Hour, testClock)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)

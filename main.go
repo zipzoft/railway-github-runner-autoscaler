@@ -55,6 +55,12 @@ type Server struct {
 	state  *State
 	client RailwayClient
 	clock  func() time.Time
+	// scaleMu serializes the compute-and-apply of the replica count across
+	// scaleUp/scaleDown/reapStaleJobs so concurrent webhooks and the reap loop
+	// can't push a stale or out-of-order numReplicas to Railway. It is separate
+	// from state.mu so the non-scaling paths (the in_progress webhook, state
+	// reads) never block on the Railway network call. Lock order: scaleMu → state.mu.
+	scaleMu sync.Mutex
 }
 
 func loadConfig() (Config, error) {

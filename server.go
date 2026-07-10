@@ -86,9 +86,14 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	log.Printf("webhook received: action=%s labels=%v", event.Action, event.WorkflowJob.Labels)
 
 	id := event.WorkflowJob.ID
+	// Scaling side-effects run on a background context with their own deadline,
+	// so a GitHub delivery connection that drops after the job state was already
+	// recorded can't cancel the scale mid-flight. Non-scaling actions ignore it.
+	scaleCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	switch event.Action {
 	case "queued":
-		if err := s.scaleUp(r.Context(), id); err != nil {
+		if err := s.scaleUp(scaleCtx, id); err != nil {
 			log.Printf("scale up error: %v", err)
 			http.Error(w, "failed to scale up", http.StatusInternalServerError)
 			return
@@ -100,7 +105,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		// the job ran to completion, failed, or was cancelled before ever starting
 		// (e.g. superseded by concurrency.cancel-in-progress). scaleDown must retire
 		// the id from every in-flight set here, since no other event will.
-		if err := s.scaleDown(r.Context(), id); err != nil {
+		if err := s.scaleDown(scaleCtx, id); err != nil {
 			log.Printf("scale down error: %v", err)
 			http.Error(w, "failed to scale down", http.StatusInternalServerError)
 			return
@@ -151,6 +156,9 @@ func (s *Server) markInProgress(id int64) {
 }
 
 func (s *Server) scaleUp(ctx context.Context, id int64) error {
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
 	s.state.mu.Lock()
 	s.state.queued[id] = s.clock()
 	total := len(s.state.queued) + len(s.state.inProgress) + len(s.state.completed)
@@ -178,6 +186,9 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 }
 
 func (s *Server) scaleDown(ctx context.Context, id int64) error {
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
 	s.state.mu.Lock()
 	// A job that is cancelled while still queued (e.g. superseded by
 	// concurrency.cancel-in-progress) never fires in_progress, so it must be
@@ -196,22 +207,30 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	next := max(1, min(queued, s.cfg.MaxRunners))
-	if err := s.client.SetReplicas(ctx, next); err != nil {
+	next, err := s.applyAndClear(ctx, queued)
+	if err != nil {
 		return err
 	}
-
-	// completed jobs are no longer using up inactive replicas we need to count for
-	s.state.mu.Lock()
-	s.state.completed = make(map[int64]struct{})
-	s.state.mu.Unlock()
-
 	if queued == 0 {
 		log.Printf("scaled down: all jobs complete, reset to 1 replica")
 	} else {
 		log.Printf("scaled down: in-progress batch done, resuming %d pending job(s) with %d replica(s)", queued, next)
 	}
 	return nil
+}
+
+// applyAndClear sets the replica count for the given still-queued job count
+// (never below 1, never above MaxRunners) and clears the completed set, which
+// no longer needs counting once the in-progress batch has drained. completed is
+// cleared regardless of whether the replica update succeeds, so a failed call
+// can't leave stale ids inflating later scale decisions. Returns the applied
+// count. Callers must hold scaleMu.
+func (s *Server) applyAndClear(ctx context.Context, queued int) (int, error) {
+	next := max(1, min(queued, s.cfg.MaxRunners))
+	s.state.mu.Lock()
+	s.state.completed = make(map[int64]struct{})
+	s.state.mu.Unlock()
+	return next, s.client.SetReplicas(ctx, next)
 }
 
 // reapLoop periodically calls reapStaleJobs until ctx is cancelled.
@@ -237,6 +256,9 @@ func (s *Server) reapLoop(ctx context.Context) {
 // default (6h) is far beyond any realistic job duration on this fleet so it
 // never fires during normal operation.
 func (s *Server) reapStaleJobs(ctx context.Context) {
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
 	now := s.clock()
 	s.state.mu.Lock()
 	var reaped []int64
@@ -266,15 +288,11 @@ func (s *Server) reapStaleJobs(ctx context.Context) {
 		return
 	}
 
-	next := max(1, min(queued, s.cfg.MaxRunners))
-	if err := s.client.SetReplicas(ctx, next); err != nil {
+	next, err := s.applyAndClear(ctx, queued)
+	if err != nil {
 		log.Printf("reap: scale error: %v", err)
 		return
 	}
-
-	s.state.mu.Lock()
-	s.state.completed = make(map[int64]struct{})
-	s.state.mu.Unlock()
 	log.Printf("reap: replicas set to %d after stale-job cleanup (queued=%d)", next, queued)
 }
 

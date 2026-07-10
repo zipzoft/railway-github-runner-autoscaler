@@ -17,19 +17,41 @@ import (
 // fakeRailwayClient records SetReplicas calls instead of hitting the network,
 // so scaling logic is testable without a live Railway project.
 type fakeRailwayClient struct {
-	mu    sync.Mutex
-	calls []int
-	err   error
+	mu            sync.Mutex
+	calls         []int
+	err           error
+	delay         time.Duration // artificial in-call delay, to widen the overlap window
+	respectCtx    bool          // honor ctx cancellation, as the real client does
+	concurrent    int           // appliers currently inside SetReplicas
+	maxConcurrent int           // high-water mark of concurrent appliers
 }
 
-func (f *fakeRailwayClient) SetReplicas(_ context.Context, n int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return f.err
+func (f *fakeRailwayClient) SetReplicas(ctx context.Context, n int) error {
+	if f.respectCtx {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
-	f.calls = append(f.calls, n)
-	return nil
+
+	f.mu.Lock()
+	f.concurrent++
+	if f.concurrent > f.maxConcurrent {
+		f.maxConcurrent = f.concurrent
+	}
+	delay, err := f.delay, f.err
+	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+
+	f.mu.Lock()
+	f.concurrent--
+	if err == nil {
+		f.calls = append(f.calls, n)
+	}
+	f.mu.Unlock()
+	return err
 }
 
 func (f *fakeRailwayClient) lastCall() (int, bool) {
@@ -217,6 +239,33 @@ func TestMarkInProgress_MovesJobFromQueuedToInProgress(t *testing.T) {
 	}
 	if _, inProg := srv.state.inProgress[1]; !inProg {
 		t.Fatalf("job should be in inProgress")
+	}
+}
+
+// TestScaling_AppliersDoNotOverlap fires many scale operations concurrently and
+// asserts the fake client never sees two appliers inside SetReplicas at once.
+// The in-call delay widens the overlap window so that, without scaleMu
+// serializing compute-and-apply, the calls would reliably overlap (maxConcurrent
+// > 1) and fail this test — which is exactly the out-of-order race the mutex fixes.
+func TestScaling_AppliersDoNotOverlap(t *testing.T) {
+	srv, client := newTestServer(10, time.Hour, testClock)
+	client.delay = 5 * time.Millisecond
+
+	var wg sync.WaitGroup
+	for id := int64(1); id <= 8; id++ {
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			_ = srv.scaleUp(context.Background(), id)
+		}(id)
+	}
+	wg.Wait()
+
+	client.mu.Lock()
+	maxc := client.maxConcurrent
+	client.mu.Unlock()
+	if maxc > 1 {
+		t.Fatalf("replica appliers overlapped (max concurrent = %d); compute-and-apply is not serialized", maxc)
 	}
 }
 
