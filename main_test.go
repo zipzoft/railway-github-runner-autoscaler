@@ -96,3 +96,12 @@ func TestLoadConfig_InvalidMaxRunners(t *testing.T) {
 		t.Fatalf("expected error for MAX_RUNNERS=0")
 	}
 }
+
+func TestNewHTTPServer_SetsTimeouts(t *testing.T) {
+	srv, _ := newTestServer(6, time.Hour, testClock)
+	hs := newHTTPServer(":0", srv)
+	if hs.ReadHeaderTimeout == 0 || hs.ReadTimeout == 0 || hs.WriteTimeout == 0 || hs.IdleTimeout == 0 {
+		t.Fatalf("server timeouts must be non-zero: readHeader=%s read=%s write=%s idle=%s",
+			hs.ReadHeaderTimeout, hs.ReadTimeout, hs.WriteTimeout, hs.IdleTimeout)
+	}
+}

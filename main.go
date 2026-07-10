@@ -139,13 +139,28 @@ func main() {
 	// defers), so the process exit itself is what ends this goroutine.
 	go srv.reapLoop(context.Background())
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/webhook", srv.handleWebhook)
-	mux.HandleFunc("/health", srv.handleHealth)
+	httpSrv := newHTTPServer(":"+cfg.Port, srv)
 
 	log.Printf("starting on :%s | service=%s max=%d labels=%v",
 		cfg.Port, cfg.ServiceID, cfg.MaxRunners, cfg.RunnerLabels)
-	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
+	}
+}
+
+// newHTTPServer builds the HTTP server with explicit timeouts. http.ListenAndServe
+// uses a zero-value server with no read/write/idle bounds, which leaves the public
+// webhook endpoint open to slow-client (Slowloris) connection exhaustion.
+func newHTTPServer(addr string, srv *Server) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook", srv.handleWebhook)
+	mux.HandleFunc("/health", srv.handleHealth)
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 }
