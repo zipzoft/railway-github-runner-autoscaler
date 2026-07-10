@@ -96,6 +96,30 @@ func TestRailwayClient_SetReplicas_MalformedResponseIsError(t *testing.T) {
 	}
 }
 
+func TestNewRailwayClient_HasTimeout(t *testing.T) {
+	c := newRailwayClient(Config{})
+	if c.httpClient.Timeout == 0 {
+		t.Fatal("the railway client must set a non-zero request timeout")
+	}
+}
+
+func TestRailwayClient_SetReplicas_TimesOut(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"data":{}}`))
+	}))
+	defer ts.Close()
+
+	c := &railwayClient{baseURL: ts.URL, httpClient: &http.Client{Timeout: 20 * time.Millisecond}}
+	start := time.Now()
+	if err := c.SetReplicas(context.Background(), 1); err == nil {
+		t.Fatal("expected a timeout error when the backend is slower than the client timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("client timeout did not bound the call: took %s", elapsed)
+	}
+}
+
 // --- scale-failure propagation to the handler ---
 
 func TestScaleUp_PropagatesClientError(t *testing.T) {

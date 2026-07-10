@@ -294,7 +294,9 @@ func newRailwayClient(cfg Config) *railwayClient {
 		serviceID:     cfg.ServiceID,
 		environmentID: cfg.EnvironmentID,
 		baseURL:       railwayGQLURL,
-		httpClient:    http.DefaultClient,
+		// An explicit timeout so a hung Railway backend can't block a webhook
+		// goroutine indefinitely; http.DefaultClient has none.
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
