@@ -17,19 +17,41 @@ import (
 // fakeRailwayClient records SetReplicas calls instead of hitting the network,
 // so scaling logic is testable without a live Railway project.
 type fakeRailwayClient struct {
-	mu    sync.Mutex
-	calls []int
-	err   error
+	mu            sync.Mutex
+	calls         []int
+	err           error
+	delay         time.Duration // artificial in-call delay, to widen the overlap window
+	respectCtx    bool          // honor ctx cancellation, as the real client does
+	concurrent    int           // appliers currently inside SetReplicas
+	maxConcurrent int           // high-water mark of concurrent appliers
 }
 
-func (f *fakeRailwayClient) SetReplicas(_ context.Context, n int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return f.err
+func (f *fakeRailwayClient) SetReplicas(ctx context.Context, n int) error {
+	if f.respectCtx {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
-	f.calls = append(f.calls, n)
-	return nil
+
+	f.mu.Lock()
+	f.concurrent++
+	if f.concurrent > f.maxConcurrent {
+		f.maxConcurrent = f.concurrent
+	}
+	delay, err := f.delay, f.err
+	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+
+	f.mu.Lock()
+	f.concurrent--
+	if err == nil {
+		f.calls = append(f.calls, n)
+	}
+	f.mu.Unlock()
+	return err
 }
 
 func (f *fakeRailwayClient) lastCall() (int, bool) {
@@ -71,6 +93,24 @@ func newTestServer(maxRunners int, ttl time.Duration, clock func() time.Time) (*
 		clock:  clock,
 	}
 	return srv, client
+}
+
+// postWebhook signs and delivers a workflow_job webhook through the real
+// handler, so tests exercise the JSON decode + HMAC path, not just the
+// internal state methods.
+func postWebhook(srv *Server, action string, id int64) *httptest.ResponseRecorder {
+	payload := fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"labels":["self-hosted","railway"]}}`, action, id)
+	body := []byte(payload)
+	mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
+	mac.Write(body)
+	sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	srv.handleWebhook(rec, req)
+	return rec
 }
 
 // --- pure helper functions ---
@@ -202,6 +242,72 @@ func TestMarkInProgress_MovesJobFromQueuedToInProgress(t *testing.T) {
 	}
 }
 
+// TestScaling_AppliersDoNotOverlap fires many scale operations concurrently and
+// asserts the fake client never sees two appliers inside SetReplicas at once.
+// The in-call delay widens the overlap window so that, without scaleMu
+// serializing compute-and-apply, the calls would reliably overlap (maxConcurrent
+// > 1) and fail this test — which is exactly the out-of-order race the mutex fixes.
+func TestScaling_AppliersDoNotOverlap(t *testing.T) {
+	srv, client := newTestServer(10, time.Hour, testClock)
+	client.delay = 5 * time.Millisecond
+
+	var wg sync.WaitGroup
+	for id := int64(1); id <= 8; id++ {
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			_ = srv.scaleUp(context.Background(), id)
+		}(id)
+	}
+	wg.Wait()
+
+	client.mu.Lock()
+	maxc := client.maxConcurrent
+	client.mu.Unlock()
+	if maxc > 1 {
+		t.Fatalf("replica appliers overlapped (max concurrent = %d); compute-and-apply is not serialized", maxc)
+	}
+}
+
+func TestMarkInProgress_IgnoresJobNotQueued(t *testing.T) {
+	srv, _ := newTestServer(6, time.Hour, testClock)
+	srv.markInProgress(999) // never queued
+
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[999]
+	srv.state.mu.Unlock()
+	if present {
+		t.Fatal("in_progress for a job that was never queued must not be injected into inProgress")
+	}
+}
+
+// TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject reproduces the
+// out-of-order delivery the guard exists for: a retried in_progress arrives
+// after the job already completed and the batch settled (which clears the
+// completed set). The id must stay out of inProgress, not leak until the reaper.
+func TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject(t *testing.T) {
+	srv, _ := newTestServer(6, time.Hour, testClock)
+	ctx := context.Background()
+
+	if err := srv.scaleUp(ctx, 100); err != nil {
+		t.Fatalf("scaleUp(100): %v", err)
+	}
+	srv.markInProgress(100)
+	if err := srv.scaleDown(ctx, 100); err != nil { // completes; batch settles; state empty
+		t.Fatalf("scaleDown(100): %v", err)
+	}
+
+	srv.markInProgress(100) // late/retried in_progress for the finished job
+
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[100]
+	n := len(srv.state.inProgress)
+	srv.state.mu.Unlock()
+	if present || n != 0 {
+		t.Fatalf("late in_progress re-injected completed job 100 (inProgress size=%d)", n)
+	}
+}
+
 // --- regression coverage for the queued-counter leak ---
 
 // TestScaleDown_CancelledWhileQueued_DoesNotLeak reproduces the production
@@ -307,18 +413,7 @@ func TestHandleWebhook_QueuedThenCancelledDoesNotLeak(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
 
 	send := func(action string, id int64) *httptest.ResponseRecorder {
-		payload := fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"labels":["self-hosted","railway"]}}`, action, id)
-		body := []byte(payload)
-		mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
-		mac.Write(body)
-		sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-
-		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
-		req.Header.Set("X-GitHub-Event", "workflow_job")
-		req.Header.Set("X-Hub-Signature-256", sig)
-		rec := httptest.NewRecorder()
-		srv.handleWebhook(rec, req)
-		return rec
+		return postWebhook(srv, action, id)
 	}
 
 	if rec := send("queued", 1); rec.Code != http.StatusOK {
