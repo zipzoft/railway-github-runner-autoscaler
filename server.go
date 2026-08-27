@@ -216,7 +216,7 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 		return err
 	}
 	if queued == 0 {
-		log.Printf("scaled down: all jobs complete, reset to 1 replica")
+		log.Printf("scaled down: all jobs complete, replicas=%d", next)
 	} else {
 		log.Printf("scaled down: in-progress batch done, resuming %d pending job(s) with %d replica(s)", queued, next)
 	}
@@ -258,14 +258,18 @@ func (s *Server) apply(ctx context.Context, queued, inProgress int) (int, error)
 	//
 	// Tracked work: while this process has jobs outstanding, never go below what
 	// it last pushed.
+	clampedBy := ""
 	if queued+inProgress > 0 && next < s.state.applied {
 		next = s.state.applied
+		clampedBy = "tracked work still outstanding"
 	}
 	// Boot-era work: jobs already running when this process started are
 	// permanently invisible to it, so its counters reading zero proves nothing
 	// until no such job could still be alive. See State.
 	if s.clock().Before(s.state.bootFloorUntil) && next < s.state.bootFloor {
 		next = s.state.bootFloor
+		clampedBy = fmt.Sprintf("boot-era floor, held until %s",
+			s.state.bootFloorUntil.Format(time.RFC3339))
 	}
 	unchanged := next == s.state.applied
 	recent := !s.state.lastPush.IsZero() && s.clock().Sub(s.state.lastPush) < coalesceWindow
@@ -286,6 +290,14 @@ func (s *Server) apply(ctx context.Context, queued, inProgress int) (int, error)
 	s.state.applied = next
 	s.state.lastPush = s.clock()
 	s.state.mu.Unlock()
+
+	if clampedBy != "" {
+		// The healthy signal that a floor is doing its job. Without it the only
+		// visible evidence is a replica count that silently refuses to fall, and
+		// an operator watching a deploy cannot tell that from a stuck service.
+		log.Printf("replicas held at %d rather than %d: %s",
+			next, max(1, min(queued+inProgress, s.cfg.MaxRunners)), clampedBy)
+	}
 	return next, nil
 }
 
@@ -377,6 +389,11 @@ func (s *Server) reapStaleJobs(ctx context.Context) {
 // apply), and nothing else would ever retry it — the batch is over, so no
 // further webhook will call apply. Left alone that bills a full-width fleet
 // until the next batch happens to drain successfully.
+//
+// The down direction is DEFERRED, not abandoned, while the boot-era floor is
+// what pins the count: re-pushing a value that floor is already holding
+// corrects nothing and would churn Railway once per tick for the whole horizon.
+// It resumes the moment the horizon lapses.
 func (s *Server) assertDesired(ctx context.Context) {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()

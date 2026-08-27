@@ -461,3 +461,32 @@ func TestAssertDesired_SilentWhileTheBootFloorIsWhatHoldsTheFleet(t *testing.T) 
 		t.Fatalf("expected contraction to 1 after the horizon, got %d (ok=%v)", last, ok)
 	}
 }
+
+// The deploy runbook tells an operator which log line means the boot floor
+// failed. That only works if the line reports what was actually pushed:
+// selecting the message from `queued == 0` announced "reset to 1 replica" while
+// a floor was holding the fleet at 6, so the designated failure signal fired on
+// every healthy boot-era batch.
+func TestScaleDown_LogsThePushedCountNotTheAssumedOne(t *testing.T) {
+	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
+	ctx := context.Background()
+
+	if err := srv.scaleUp(ctx, 1); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	srv.markInProgress(1)
+	if err := srv.scaleDown(ctx, 1); err != nil {
+		t.Fatalf("scaleDown: %v", err)
+	}
+
+	last, ok := client.lastCall()
+	if !ok {
+		t.Fatal("expected a push")
+	}
+	// The value the drain branch reports must be the value that reached Railway.
+	// scaleDown returns it from apply, so pinning apply's return is pinning the
+	// number in the log line.
+	if last != 6 {
+		t.Fatalf("expected the floor to hold the push at 6, got %d", last)
+	}
+}
