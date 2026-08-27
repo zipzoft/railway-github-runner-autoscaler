@@ -124,11 +124,11 @@ func TestRailwayClient_SetReplicas_TimesOut(t *testing.T) {
 
 func TestScaleUp_PropagatesClientError(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
-	if err := srv.scaleUp(context.Background(), 1); err != nil { // 1 unfinished job → SetReplicas(1)
+	if err := srv.scaleUp(context.Background(), 1, testRepo); err != nil { // 1 unfinished job → SetReplicas(1)
 		t.Fatalf("scaleUp(1): %v", err)
 	}
 	client.err = fmt.Errorf("railway down")
-	if err := srv.scaleUp(context.Background(), 2); err == nil { // 2 unfinished → SetReplicas(2)
+	if err := srv.scaleUp(context.Background(), 2, testRepo); err == nil { // 2 unfinished → SetReplicas(2)
 		t.Fatal("expected scaleUp to propagate the client error")
 	}
 }
@@ -139,10 +139,10 @@ func TestScaleDown_PropagatesClientError(t *testing.T) {
 	// Two jobs, so draining them changes the count (2 → 1) and the push is not
 	// coalesced away as a repeat of an unchanged value.
 	for _, id := range []int64{1, 2} {
-		if err := srv.scaleUp(ctx, id); err != nil {
+		if err := srv.scaleUp(ctx, id, testRepo); err != nil {
 			t.Fatalf("scaleUp(%d): %v", id, err)
 		}
-		srv.markInProgress(id)
+		srv.markInProgress(id, testRepo)
 	}
 	if err := srv.scaleDown(ctx, 1); err != nil {
 		t.Fatalf("scaleDown(1): %v", err) // job 2 still in progress, replicas held

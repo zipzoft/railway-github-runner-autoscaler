@@ -121,7 +121,7 @@ func TestSeedFloorOnce_DoesNotOverwriteAFloorAScaleDecisionAlreadySet(t *testing
 	srv, client := newTestServer(6, time.Hour, testClock)
 	ctx := context.Background()
 	for id := int64(1); id <= 3; id++ {
-		if err := srv.scaleUp(ctx, id); err != nil {
+		if err := srv.scaleUp(ctx, id, testRepo); err != nil {
 			t.Fatalf("scaleUp(%d): %v", id, err)
 		}
 	}

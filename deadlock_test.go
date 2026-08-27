@@ -41,7 +41,7 @@ func seedStuckFleet(srv *Server, stuck int) {
 	srv.state.mu.Lock()
 	defer srv.state.mu.Unlock()
 	for i := 1; i <= stuck; i++ {
-		srv.state.inProgress[int64(9000+i)] = srv.clock()
+		srv.state.inProgress[int64(9000+i)] = jobEntry{since: srv.clock(), repo: testRepo}
 	}
 }
 
@@ -54,7 +54,7 @@ func TestScaleUp_BacklogOverMaxStillAssertsCap(t *testing.T) {
 
 	// 30 queued jobs arrive behind the phantoms, taking the total far past the cap.
 	for id := int64(1); id <= 30; id++ {
-		if err := srv.scaleUp(ctx, id); err != nil {
+		if err := srv.scaleUp(ctx, id, testRepo); err != nil {
 			t.Fatalf("scaleUp(%d): %v", id, err)
 		}
 	}
@@ -69,7 +69,7 @@ func TestScaleUp_BacklogOverMaxStillAssertsCap(t *testing.T) {
 	// suppressed as a repeat.
 	now = now.Add(2 * coalesceWindow)
 	before := len(client.allCalls())
-	if err := srv.scaleUp(ctx, 31); err != nil {
+	if err := srv.scaleUp(ctx, 31, testRepo); err != nil {
 		t.Fatalf("scaleUp(31): %v", err)
 	}
 	after := client.allCalls()
@@ -95,10 +95,10 @@ func TestScaleDown_CompletedJobsNeitherAccumulateNorInflateDesiredCount(t *testi
 
 	// 200 jobs run to completion while the phantom entry is never retired.
 	for id := int64(1); id <= 200; id++ {
-		if err := srv.scaleUp(ctx, id); err != nil {
+		if err := srv.scaleUp(ctx, id, testRepo); err != nil {
 			t.Fatalf("scaleUp(%d): %v", id, err)
 		}
-		srv.markInProgress(id)
+		srv.markInProgress(id, testRepo)
 		if err := srv.scaleDown(ctx, id); err != nil {
 			t.Fatalf("scaleDown(%d): %v", id, err)
 		}
@@ -139,7 +139,7 @@ func TestScaleUp_ColdStartAssertsWithoutShrinkingAPossiblyLiveFleet(t *testing.T
 	// way to tell, so it boots with the floor read back from that count.
 	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
 
-	if err := srv.scaleUp(context.Background(), 1); err != nil {
+	if err := srv.scaleUp(context.Background(), 1, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
 
@@ -163,10 +163,10 @@ func TestApply_BootFloorReleasesWhenTheHorizonPasses(t *testing.T) {
 	srv, client := newTestServerWithLiveFleet(6, 6, ttl, clock)
 	ctx := context.Background()
 
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
-	srv.markInProgress(1)
+	srv.markInProgress(1, testRepo)
 	if err := srv.scaleDown(ctx, 1); err != nil {
 		t.Fatalf("scaleDown: %v", err)
 	}
@@ -194,10 +194,10 @@ func TestApply_ATrackedJobCycleDoesNotReleaseTheFloorUnderBootEraWork(t *testing
 	ctx := context.Background()
 
 	// One ordinary tracked cycle while 5 boot-era jobs are still running.
-	if err := srv.scaleUp(ctx, 100); err != nil {
+	if err := srv.scaleUp(ctx, 100, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
-	srv.markInProgress(100)
+	srv.markInProgress(100, testRepo)
 	if err := srv.scaleDown(ctx, 100); err != nil {
 		t.Fatalf("scaleDown: %v", err)
 	}
@@ -223,10 +223,10 @@ func TestApply_NeverShrinksTheFleetWhileAJobIsStillRunning(t *testing.T) {
 	ctx := context.Background()
 
 	for id := int64(1); id <= 6; id++ {
-		if err := srv.scaleUp(ctx, id); err != nil {
+		if err := srv.scaleUp(ctx, id, testRepo); err != nil {
 			t.Fatalf("scaleUp(%d): %v", id, err)
 		}
-		srv.markInProgress(id)
+		srv.markInProgress(id, testRepo)
 	}
 	for id := int64(1); id <= 5; id++ {
 		if err := srv.scaleDown(ctx, id); err != nil {
@@ -239,7 +239,7 @@ func TestApply_NeverShrinksTheFleetWhileAJobIsStillRunning(t *testing.T) {
 	// Job 6 is still running on one of the six replicas. Past the coalesce
 	// window so this decision genuinely pushes.
 	now = now.Add(2 * coalesceWindow)
-	if err := srv.scaleUp(ctx, 7); err != nil {
+	if err := srv.scaleUp(ctx, 7, testRepo); err != nil {
 		t.Fatalf("scaleUp(7): %v", err)
 	}
 
@@ -265,7 +265,7 @@ func TestAssertDesired_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t *te
 	srv, client := newTestServer(6, time.Hour, clock)
 	ctx := context.Background()
 
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
 	before := len(client.allCalls())
@@ -295,7 +295,7 @@ func TestReapLoop_TickRepushesOutstandingWorkWithoutAnyWebhook(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
 	before := len(client.allCalls())
@@ -340,7 +340,7 @@ func TestApply_CoalescesUnchangedPushesWithinTheWindow(t *testing.T) {
 	// and every push after that is identical.
 	for id := int64(1); id <= 30; id++ {
 		now = now.Add(time.Second)
-		if err := srv.scaleUp(ctx, id); err != nil {
+		if err := srv.scaleUp(ctx, id, testRepo); err != nil {
 			t.Fatalf("scaleUp(%d): %v", id, err)
 		}
 	}
@@ -402,10 +402,10 @@ func TestAssertDesired_RetriesAContractionThatFailed(t *testing.T) {
 	srv, client := newTestServerWithLiveFleet(6, 6, ttl, clock)
 	ctx := context.Background()
 
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
-	srv.markInProgress(1)
+	srv.markInProgress(1, testRepo)
 
 	// Past the boot horizon, so the end-of-batch contraction is genuinely due.
 	now = now.Add(ttl + time.Minute)
@@ -471,10 +471,10 @@ func TestScaleDown_LogsThePushedCountNotTheAssumedOne(t *testing.T) {
 	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
 	ctx := context.Background()
 
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
-	srv.markInProgress(1)
+	srv.markInProgress(1, testRepo)
 	if err := srv.scaleDown(ctx, 1); err != nil {
 		t.Fatalf("scaleDown: %v", err)
 	}
