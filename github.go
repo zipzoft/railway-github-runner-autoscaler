@@ -302,7 +302,12 @@ func (s *Server) reconcile(ctx context.Context) {
 
 	// --- lookups, no locks held ---
 	var finished []candidate
-	var checked, active, notFound, failed int
+	var checked, active int
+	// Collected rather than logged per id. A mis-scoped token 404s on EVERY
+	// tracked job, so a line each would put ~50 identical explanations in the log
+	// every 5 minutes and bury the census that actually summarises the cycle.
+	var notFoundIDs, failedIDs []int64
+	var lastErr error
 	rateLimited := false
 	for _, c := range cands {
 		if err := ctx.Err(); err != nil {
@@ -325,13 +330,10 @@ func (s *Server) reconcile(ctx context.Context) {
 			log.Printf("[WARN] reconcile: GitHub rate-limited this cycle after %d lookup(s) (%v); "+
 				"abandoning the rest rather than deepening it", checked, err)
 		case errors.Is(err, errJobNotFound):
-			notFound++
-			log.Printf("reconcile: GitHub does not recognise job %d in %s — either the run was deleted or "+
-				"GITHUB_TOKEN cannot read that repository. Keeping the entry; a 404 is not a completion, "+
-				"and pruning on one would delete live jobs the token simply cannot see", c.id, c.entry.repo)
+			notFoundIDs = append(notFoundIDs, c.id)
 		case err != nil:
-			failed++
-			log.Printf("reconcile: could not check job %d in %s (%v); keeping the entry", c.id, c.entry.repo, err)
+			failedIDs = append(failedIDs, c.id)
+			lastErr = err
 		case live == jobFinished:
 			finished = append(finished, c)
 		default:
@@ -346,13 +348,23 @@ func (s *Server) reconcile(ctx context.Context) {
 	// observed: with 404-keeps-the-entry, a token scoped to the wrong
 	// repositories produces a service that looks healthy, logs nothing alarming,
 	// and does exactly nothing.
+	if len(notFoundIDs) > 0 {
+		log.Printf("reconcile: GitHub does not recognise %d job(s): %v. Either their runs were deleted or "+
+			"GITHUB_TOKEN cannot read the repositories they ran in. Keeping every one — a 404 is not a "+
+			"completion, and GitHub answers 404 for a repository a token cannot see, so pruning on one "+
+			"would delete live jobs. They clear on the %s horizon", len(notFoundIDs), notFoundIDs, s.cfg.StaleJobTTL)
+	}
+	if len(failedIDs) > 0 {
+		log.Printf("reconcile: could not check %d job(s): %v (last error: %v); keeping every one",
+			len(failedIDs), failedIDs, lastErr)
+	}
 	log.Printf("reconcile: checked=%d finished=%d active=%d notfound=%d error=%d (of %d tracked)",
-		checked, len(finished), active, notFound, failed, tracked)
+		checked, len(finished), active, len(notFoundIDs), len(failedIDs), tracked)
 	// A cycle cut short by a rate limit says nothing about whether the token can
 	// see these repositories, so it must not count toward the blind run — in
 	// either direction.
 	if !rateLimited {
-		s.noteBlindCycle(checked > 0 && notFound == checked)
+		s.noteBlindCycle(checked > 0 && len(notFoundIDs) == checked)
 	}
 
 	if len(finished) == 0 {
