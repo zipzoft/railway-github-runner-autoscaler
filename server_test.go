@@ -20,6 +20,8 @@ type fakeRailwayClient struct {
 	mu            sync.Mutex
 	calls         []int
 	err           error
+	replicas      int           // what Railway reports at boot, seeding the floor
+	replicasErr   error         // simulate a failed boot read
 	delay         time.Duration // artificial in-call delay, to widen the overlap window
 	respectCtx    bool          // honor ctx cancellation, as the real client does
 	concurrent    int           // appliers currently inside SetReplicas
@@ -54,6 +56,15 @@ func (f *fakeRailwayClient) SetReplicas(ctx context.Context, n int) error {
 	return err
 }
 
+// Replicas reports the fleet size Railway would return at boot. The zero value
+// means "Railway has no replicas configured", which seeds an unconstrained floor
+// — the right default for the tests that exercise the ramp from an idle fleet.
+func (f *fakeRailwayClient) Replicas(ctx context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.replicas, f.replicasErr
+}
+
 func (f *fakeRailwayClient) lastCall() (int, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -84,10 +95,7 @@ func newTestServer(maxRunners int, ttl time.Duration, clock func() time.Time) (*
 			StaleJobTTL:   ttl,
 			RunnerLabels:  []string{"self-hosted", "railway"},
 		},
-		state: &State{
-			queued:     make(map[int64]time.Time),
-			inProgress: make(map[int64]time.Time),
-		},
+		state:  newState(seedFloor(context.Background(), client, maxRunners)),
 		client: client,
 		clock:  clock,
 	}
@@ -186,26 +194,37 @@ func TestScaleUp_ConcurrentJobsScaleReplicas(t *testing.T) {
 }
 
 func TestScaleUp_CapsAtMaxRunners(t *testing.T) {
-	srv, client := newTestServer(2, time.Hour, testClock)
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(2, time.Hour, clock)
 	ctx := context.Background()
 	_ = srv.scaleUp(ctx, 1) // 1 unfinished job  -> 1 replica
 	_ = srv.scaleUp(ctx, 2) // 2 unfinished jobs -> 2 replicas, at the cap
-	_ = srv.scaleUp(ctx, 3) // 3 unfinished jobs -> held at the cap, still asserted
+	_ = srv.scaleUp(ctx, 3) // 3 unfinished jobs -> same value, coalesced
 
 	calls := client.allCalls()
-	if len(calls) != 3 {
-		t.Fatalf("every scale decision must assert a replica count, got %v", calls)
-	}
 	for _, n := range calls {
 		if n > 2 {
 			t.Fatalf("replica count exceeded MaxRunners=2: %v", calls)
 		}
 	}
-	// Capping means the fleet is HELD at the cap, not that the service stops
-	// managing it: the over-cap decision must still push the cap so a fleet
-	// that lost its runners gets them back (ATT-482).
 	if last := calls[len(calls)-1]; last != 2 {
-		t.Fatalf("expected the over-cap decision to hold the fleet at 2, got %v", calls)
+		t.Fatalf("expected the fleet held at the cap 2, got %v", calls)
+	}
+
+	// Capping means the fleet is HELD at the cap, not that the service stops
+	// managing it. Once the coalesce window lapses the cap must be re-asserted,
+	// because that push is the only thing that can revive a fleet which lost its
+	// runners while over the cap (ATT-482).
+	now = now.Add(2 * coalesceWindow)
+	before := len(calls)
+	_ = srv.scaleUp(ctx, 4)
+	after := client.allCalls()
+	if len(after) == before {
+		t.Fatalf("over-cap decision past the coalesce window made no call: %v", after)
+	}
+	if last := after[len(after)-1]; last != 2 {
+		t.Fatalf("expected the cap re-asserted at 2, got %v", after)
 	}
 }
 

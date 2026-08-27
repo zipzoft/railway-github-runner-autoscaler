@@ -20,6 +20,19 @@ import (
 
 // seedStuckFleet reproduces the leaked-counter state: `stuck` phantom
 // inProgress entries that will never receive a terminal webhook.
+// newTestServerWithLiveFleet mirrors production boot against a Railway that
+// already has `live` replicas configured — the state a restart lands in when it
+// happens mid-batch. seedFloor is re-run because the floor is seeded at boot
+// from exactly this read.
+func newTestServerWithLiveFleet(maxRunners, live int, ttl time.Duration, clock func() time.Time) (*Server, *fakeRailwayClient) {
+	srv, client := newTestServer(maxRunners, ttl, clock)
+	client.replicas = live
+	srv.state.mu.Lock()
+	srv.state.applied = seedFloor(context.Background(), client, maxRunners)
+	srv.state.mu.Unlock()
+	return srv, client
+}
+
 func seedStuckFleet(srv *Server, stuck int) {
 	srv.state.mu.Lock()
 	defer srv.state.mu.Unlock()
@@ -29,7 +42,9 @@ func seedStuckFleet(srv *Server, stuck int) {
 }
 
 func TestScaleUp_BacklogOverMaxStillAssertsCap(t *testing.T) {
-	srv, client := newTestServer(6, time.Hour, testClock)
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(6, time.Hour, clock)
 	seedStuckFleet(srv, 4)
 	ctx := context.Background()
 
@@ -46,6 +61,9 @@ func TestScaleUp_BacklogOverMaxStillAssertsCap(t *testing.T) {
 	// logged "at max runners" and returned without ever calling SetReplicas
 	// again — no runner could start, so no job could complete, so no terminal
 	// webhook could arrive to unwind the count. Closed loop.
+	// Past the coalesce window, so a re-push is genuinely due rather than
+	// suppressed as a repeat.
+	now = now.Add(2 * coalesceWindow)
 	before := len(client.allCalls())
 	if err := srv.scaleUp(ctx, 31); err != nil {
 		t.Fatalf("scaleUp(31): %v", err)
@@ -105,13 +123,17 @@ func TestScaleDown_CompletedJobsNeitherAccumulateNorInflateDesiredCount(t *testi
 	}
 }
 
-// After a redeploy the in-memory counters are empty but the fleet's real
-// replicas may be wedged or gone. Trusting an unobserved "base replica" means
-// the first job after boot gets no runner at all — exactly the state ATT-482
-// left behind. The count must be asserted, not assumed; SetReplicas is
-// idempotent so re-asserting the current value is free.
-func TestScaleUp_ColdStartAssertsReplicaCountRatherThanAssumingBaseReplica(t *testing.T) {
-	srv, client := newTestServer(6, time.Hour, testClock)
+// After a redeploy the in-memory counters are empty but the fleet is whatever it
+// was — possibly six replicas mid-job. The two ways of being wrong are not
+// symmetric: assuming the fleet is healthy leaves a dead one asleep (ATT-482),
+// while assuming it is idle shrinks a live one and cancels running CI jobs. So
+// the first decision after boot must assert a count (to revive a dead fleet)
+// and that count must never be lower than the cap (so it cannot shrink a live
+// one).
+func TestScaleUp_ColdStartAssertsWithoutShrinkingAPossiblyLiveFleet(t *testing.T) {
+	// Railway already has 6 replicas, which may be mid-job — this process has no
+	// way to tell, so it boots with the floor read back from that count.
+	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
 
 	if err := srv.scaleUp(context.Background(), 1); err != nil {
 		t.Fatalf("scaleUp: %v", err)
@@ -121,11 +143,191 @@ func TestScaleUp_ColdStartAssertsReplicaCountRatherThanAssumingBaseReplica(t *te
 	if !ok {
 		t.Fatalf("first job after boot must assert the replica count, but SetReplicas was never called")
 	}
-	if last != 1 {
-		t.Fatalf("expected replicas asserted at 1 for a single job, got %d", last)
+	if last != 6 {
+		t.Fatalf("first decision after boot pushed %d against a fleet of 6; the naive count for one "+
+			"queued job is 1, and pushing it would drop 5 replicas that may each be mid-job", last)
 	}
 }
 
+// The floor must release itself, or a restart would pin the fleet at the cap
+// forever and bill six idle runners. A genuine drain — nothing queued, nothing
+// in progress — is the one moment this process knows shrinking is safe.
+func TestApply_FloorReleasesOnGenuineDrain(t *testing.T) {
+	srv, client := newTestServer(6, time.Hour, testClock)
+	ctx := context.Background()
+
+	if err := srv.scaleUp(ctx, 1); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	srv.markInProgress(1)
+	if err := srv.scaleDown(ctx, 1); err != nil {
+		t.Fatalf("scaleDown: %v", err)
+	}
+
+	if last, ok := client.lastCall(); !ok || last != 1 {
+		t.Fatalf("expected the fleet released to 1 replica once fully drained, got %d (ok=%v)", last, ok)
+	}
+}
+
+// The floor is now the ONLY thing standing between a scale decision and a
+// cancelled CI job, and a mutation test showed the whole suite stayed green with
+// the floor block deleted. This pins it directly: six jobs running, five finish
+// (scaleDown holds the count), then a new job is queued — the naive count for
+// "1 queued + 1 in progress" is 2, and pushing 2 would drop four replicas, one
+// of which is still working.
+func TestApply_NeverShrinksTheFleetWhileAJobIsStillRunning(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(6, time.Hour, clock)
+	ctx := context.Background()
+
+	for id := int64(1); id <= 6; id++ {
+		if err := srv.scaleUp(ctx, id); err != nil {
+			t.Fatalf("scaleUp(%d): %v", id, err)
+		}
+		srv.markInProgress(id)
+	}
+	for id := int64(1); id <= 5; id++ {
+		if err := srv.scaleDown(ctx, id); err != nil {
+			t.Fatalf("scaleDown(%d): %v", id, err)
+		}
+	}
+
+	rampCalls := len(client.allCalls()) // the legitimate 1..6 ramp-up
+
+	// Job 6 is still running on one of the six replicas. Past the coalesce
+	// window so this decision genuinely pushes.
+	now = now.Add(2 * coalesceWindow)
+	if err := srv.scaleUp(ctx, 7); err != nil {
+		t.Fatalf("scaleUp(7): %v", err)
+	}
+
+	after := client.allCalls()
+	if len(after) == rampCalls {
+		t.Fatalf("expected the post-drain decision to push, got no call (calls=%v)", after)
+	}
+	for _, n := range after[rampCalls:] {
+		if n < 6 {
+			t.Fatalf("pushed %d replicas while job 6 was still running; Railway may drop any "+
+				"replica when the count shrinks, including the one mid-job (calls=%v)", n, after)
+		}
+	}
+}
+
+// Recovery must not depend on another webhook arriving. Webhooks fire on job
+// state CHANGES; a queued job that no runner ever picks up has no further state
+// to change. If the fleet dies after the last job was queued, nothing else
+// would call apply and the backlog would sit until the 6h TTL.
+func TestAssertOutstanding_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(6, time.Hour, clock)
+	ctx := context.Background()
+
+	if err := srv.scaleUp(ctx, 1); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	before := len(client.allCalls())
+
+	// No further webhooks ever arrive; only the reap loop ticks.
+	now = now.Add(reapInterval)
+	srv.assertOutstanding(ctx)
+
+	after := client.allCalls()
+	if len(after) == before {
+		t.Fatalf("a queued job with a dead fleet and no further webhooks produced no scale call; " +
+			"recovery still depends on CI staying busy")
+	}
+	if last := after[len(after)-1]; last != 1 {
+		t.Fatalf("expected the outstanding-work assert to re-push 1 for the single queued job, got %d", last)
+	}
+}
+
+// The background loop must actually be wired to the assert: a mutation that
+// dropped assertOutstanding from the tick left the rest of the suite green,
+// because the other tests call it directly.
+func TestReapLoop_TickRepushesOutstandingWorkWithoutAnyWebhook(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(6, time.Hour, clock)
+	srv.tickInterval = 2 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := srv.scaleUp(ctx, 1); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	before := len(client.allCalls())
+
+	// No further webhooks; only the loop runs. Move past the coalesce window so
+	// the repeat push is due.
+	now = now.Add(2 * coalesceWindow)
+	go srv.reapLoop(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.allCalls()) > before {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the background loop never re-asserted the replica count for outstanding work; "+
+		"recovery still depends on a webhook arriving (calls=%v)", client.allCalls())
+}
+
+// Nothing outstanding means nothing to assert — the periodic path must not churn
+// Railway on an idle fleet.
+func TestAssertOutstanding_SilentWhenNothingIsOutstanding(t *testing.T) {
+	srv, client := newTestServer(6, time.Hour, testClock)
+	srv.assertOutstanding(context.Background())
+	if _, ok := client.lastCall(); ok {
+		t.Fatalf("idle fleet must not be re-pushed")
+	}
+}
+
+// Asserting on every webhook is what breaks the deadlock, but issuing one
+// serialized Railway mutation per webhook pushes the tail of a 30-job burst past
+// GitHub's delivery timeout. An unchanged count within coalesceWindow is
+// therefore suppressed — and assertOutstanding covers the suppressed window.
+func TestApply_CoalescesUnchangedPushesWithinTheWindow(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(6, time.Hour, clock)
+	ctx := context.Background()
+
+	// A 30-job burst arriving inside the window: the count saturates at the cap
+	// and every push after that is identical.
+	for id := int64(1); id <= 30; id++ {
+		now = now.Add(time.Second)
+		if err := srv.scaleUp(ctx, id); err != nil {
+			t.Fatalf("scaleUp(%d): %v", id, err)
+		}
+	}
+
+	// The count ramps 1..6 as the backlog grows — those pushes are all distinct
+	// and must happen. Everything after saturation is the same value 24 times
+	// over, and must collapse to the single push that first reached the cap.
+	calls := client.allCalls()
+	atCap := 0
+	for _, n := range calls {
+		if n == 6 {
+			atCap++
+		}
+	}
+	if atCap != 1 {
+		t.Fatalf("the cap was pushed %d times; the 24 identical pushes after saturation must be "+
+			"coalesced within %s (calls=%v)", atCap, coalesceWindow, calls)
+	}
+	// Suppression must not cost correctness: the cap is still what was asserted.
+	if last, ok := client.lastCall(); !ok || last != 6 {
+		t.Fatalf("expected the cap asserted despite coalescing, got %d (ok=%v)", last, ok)
+	}
+}
+
+// Characterization test — this passes on the base commit too. It is here
+// because the reaper is the one path that can shrink the fleet on entries it
+// decided were abandoned, and nothing else in the suite covers it.
+//
 // The reaper is the last line of defence: once the phantoms age out, the fleet
 // must return to its idle baseline rather than staying pinned at the cap.
 func TestReapStaleJobs_ClearsPhantomsAndReturnsFleetToBaseline(t *testing.T) {
