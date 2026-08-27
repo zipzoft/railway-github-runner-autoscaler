@@ -38,6 +38,26 @@ const (
 	// seedTimeout bounds the boot-time replica read. The read holds no locks, so
 	// nothing waits on it — not the listener, not a webhook.
 	seedTimeout = 10 * time.Second
+	// reconcileBudget is the WALL-CLOCK ceiling on one reconcile pass, and it is
+	// not the same bound as reconcileMaxPerCycle. That one caps requests against
+	// GitHub's hourly budget; this one caps how long the background tick can be
+	// held up. They protect different things and dropping either reintroduces a
+	// failure: without this bound, a degraded GitHub (50 ids x a 10s timeout =
+	// 500s) outlasts the 300s reapInterval, the ticker's single-slot channel
+	// drops ticks, and assertDesired runs at half cadence or worse — precisely
+	// when it is needed most, since the same provider that is failing to answer
+	// lookups is the one failing to deliver webhooks. assertDesired is what makes
+	// the no-deadlock guarantee unconditional (ATT-482); nothing new may make it
+	// conditional on GitHub's latency.
+	reconcileBudget = 60 * time.Second
+	// reconcileMaxPerCycle bounds the GitHub lookups one reconcile pass may
+	// issue. The tracked set is normally at most a handful of ids, so this is a
+	// backstop against a pathological state rather than a routine limit: at one
+	// pass per reapInterval it caps the service at 50 x 12 = 600 requests/hour
+	// against a 5,000/hour authenticated budget. Entries are checked oldest
+	// first, so a capped cycle spends its budget on the ids nearest the TTL
+	// horizon — the ones most likely to be leaked.
+	reconcileMaxPerCycle = 50
 )
 
 type Config struct {
@@ -49,6 +69,12 @@ type Config struct {
 	Port          string
 	RunnerLabels  []string
 	StaleJobTTL   time.Duration
+	// GitHubToken is OPTIONAL. Empty disables reconcile and leaves StaleJobTTL as
+	// the only cleanup, which is exactly how this service behaved before
+	// reconcile existed. It is optional on purpose: writing a credential onto
+	// this shared service is a human-gated action, so the code has to be able to
+	// ship and run before anyone has set the value.
+	GitHubToken string
 }
 
 // State tracks each unfinished job by GitHub job ID. queued and inProgress
@@ -82,12 +108,21 @@ type Config struct {
 // GitHub's own view of in-progress jobs is what removes the horizon entirely.
 type State struct {
 	mu             sync.Mutex
-	queued         map[int64]time.Time
-	inProgress     map[int64]time.Time
+	queued         map[int64]jobEntry
+	inProgress     map[int64]jobEntry
 	applied        int
 	lastPush       time.Time
 	bootFloor      int
 	bootFloorUntil time.Time
+	// blindCycles counts consecutive reconcile passes in which every single
+	// lookup came back "not found". One such pass is unremarkable; a run of them
+	// is the signature of a token that cannot read the repositories the jobs are
+	// in, which makes reconcile a silent no-op — the exact 7h leak it exists to
+	// remove, with nothing else to show for it.
+	blindCycles int
+	// seq hands out a fresh identity to every entry inserted into either set.
+	// See jobEntry.seq for why reconcile cannot use the timestamp for this.
+	seq uint64
 }
 
 // RailwayClient scales the runner service. It is an interface so tests can
@@ -103,10 +138,19 @@ type Server struct {
 	cfg    Config
 	state  *State
 	client RailwayClient
+	// github answers "is this job still alive?" during reconcile. It is nil when
+	// GITHUB_TOKEN is unset, and a nil github disables reconcile entirely: the
+	// service then behaves exactly as it did before reconcile existed, with the
+	// StaleJobTTL reaper as the only cleanup. That is what lets this ship before
+	// a human has set the token on the service.
+	github GitHubClient
 	clock  func() time.Time
 	// tickInterval overrides reapInterval for tests that need the background loop
 	// to run at a testable cadence. Zero means reapInterval.
 	tickInterval time.Duration
+	// reconcileBudget overrides the wall-clock ceiling on one reconcile pass for
+	// tests that need it to expire quickly. Zero means the package default.
+	reconcileBudget time.Duration
 	// scaleMu serializes the compute-and-apply of the replica count across
 	// scaleUp/scaleDown/reapStaleJobs so concurrent webhooks and the reap loop
 	// can't push a stale or out-of-order numReplicas to Railway. It is separate
@@ -171,6 +215,7 @@ func loadConfig() (Config, error) {
 		Port:          port,
 		RunnerLabels:  labels,
 		StaleJobTTL:   time.Duration(staleJobTTLMin) * time.Minute,
+		GitHubToken:   os.Getenv("GITHUB_TOKEN"),
 	}, nil
 }
 
@@ -183,8 +228,8 @@ func loadConfig() (Config, error) {
 // has had a chance to refine the value downward against reality.
 func newState(applied int, now time.Time, ttl time.Duration) *State {
 	return &State{
-		queued:         make(map[int64]time.Time),
-		inProgress:     make(map[int64]time.Time),
+		queued:         make(map[int64]jobEntry),
+		inProgress:     make(map[int64]jobEntry),
 		applied:        applied,
 		bootFloor:      applied,
 		bootFloorUntil: now.Add(ttl),
@@ -242,6 +287,29 @@ func main() {
 		state:  newState(cfg.MaxRunners, time.Now(), cfg.StaleJobTTL),
 		client: newRailwayClient(cfg),
 		clock:  time.Now,
+	}
+	if cfg.GitHubToken != "" {
+		gh := newGitHubClient(cfg.GitHubToken)
+		srv.github = gh
+		log.Printf("reconcile enabled: tracked jobs are checked against GitHub every %s, so a lost "+
+			"terminal webhook clears within one cycle instead of on the %s horizon", reapInterval, cfg.StaleJobTTL)
+		// Confirm the credential works now rather than at the first leak. Off the
+		// critical path for the same reason the Railway seed is: nothing about
+		// serving webhooks may wait on an external round-trip.
+		go func() {
+			probeCtx, cancel := context.WithTimeout(ctx, seedTimeout)
+			defer cancel()
+			if err := gh.probe(probeCtx); err != nil {
+				log.Printf("[WARN] GITHUB_TOKEN did not authenticate (%v); reconcile will run but every "+
+					"lookup will fail, leaving the %s horizon as the only cleanup", err, cfg.StaleJobTTL)
+				return
+			}
+			log.Printf("GITHUB_TOKEN authenticated")
+		}()
+	} else {
+		log.Printf("reconcile DISABLED: GITHUB_TOKEN is not set, so a job whose terminal webhook is lost "+
+			"holds a replica until the %s STALE_JOB_TTL horizon. Set GITHUB_TOKEN to a token with "+
+			"actions:read to enable it", cfg.StaleJobTTL)
 	}
 
 	// The job counters start empty on every boot and are deliberately not

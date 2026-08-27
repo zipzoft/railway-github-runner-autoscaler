@@ -113,11 +113,20 @@ func newTestServer(maxRunners int, ttl time.Duration, clock func() time.Time) (*
 	return srv, client
 }
 
+// testRepo is the owner/name every fixture job belongs to. Reconcile cannot ask
+// GitHub about an entry that has no repo, so a fixture that omits it would make
+// every reconcile test vacuously pass.
+const testRepo = "zipzoft/products"
+
 // postWebhook signs and delivers a workflow_job webhook through the real
 // handler, so tests exercise the JSON decode + HMAC path, not just the
-// internal state methods.
+// internal state methods. The payload carries `repository` because the real one
+// does, and because dropping it is exactly how the repo capture would regress
+// unnoticed.
 func postWebhook(srv *Server, action string, id int64) *httptest.ResponseRecorder {
-	payload := fmt.Sprintf(`{"action":%q,"workflow_job":{"id":%d,"labels":["self-hosted","railway"]}}`, action, id)
+	payload := fmt.Sprintf(
+		`{"action":%q,"workflow_job":{"id":%d,"labels":["self-hosted","railway"]},"repository":{"full_name":%q}}`,
+		action, id, testRepo)
 	body := []byte(payload)
 	mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
 	mac.Write(body)
@@ -192,10 +201,10 @@ func TestValidateHMAC(t *testing.T) {
 func TestScaleUp_ConcurrentJobsScaleReplicas(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
 	ctx := context.Background()
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp(1): %v", err)
 	}
-	if err := srv.scaleUp(ctx, 2); err != nil {
+	if err := srv.scaleUp(ctx, 2, testRepo); err != nil {
 		t.Fatalf("scaleUp(2): %v", err)
 	}
 	last, ok := client.lastCall()
@@ -209,9 +218,9 @@ func TestScaleUp_CapsAtMaxRunners(t *testing.T) {
 	clock := func() time.Time { return now }
 	srv, client := newTestServer(2, time.Hour, clock)
 	ctx := context.Background()
-	_ = srv.scaleUp(ctx, 1) // 1 unfinished job  -> 1 replica
-	_ = srv.scaleUp(ctx, 2) // 2 unfinished jobs -> 2 replicas, at the cap
-	_ = srv.scaleUp(ctx, 3) // 3 unfinished jobs -> same value, coalesced
+	_ = srv.scaleUp(ctx, 1, testRepo) // 1 unfinished job  -> 1 replica
+	_ = srv.scaleUp(ctx, 2, testRepo) // 2 unfinished jobs -> 2 replicas, at the cap
+	_ = srv.scaleUp(ctx, 3, testRepo) // 3 unfinished jobs -> same value, coalesced
 
 	calls := client.allCalls()
 	for _, n := range calls {
@@ -229,7 +238,7 @@ func TestScaleUp_CapsAtMaxRunners(t *testing.T) {
 	// runners while over the cap (ATT-482).
 	now = now.Add(2 * coalesceWindow)
 	before := len(calls)
-	_ = srv.scaleUp(ctx, 4)
+	_ = srv.scaleUp(ctx, 4, testRepo)
 	after := client.allCalls()
 	if len(after) == before {
 		t.Fatalf("over-cap decision past the coalesce window made no call: %v", after)
@@ -242,10 +251,10 @@ func TestScaleUp_CapsAtMaxRunners(t *testing.T) {
 func TestScaleDown_WaitsForRemainingInProgressJobs(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
 	ctx := context.Background()
-	_ = srv.scaleUp(ctx, 1)
-	srv.markInProgress(1)
-	_ = srv.scaleUp(ctx, 2)
-	srv.markInProgress(2)
+	_ = srv.scaleUp(ctx, 1, testRepo)
+	srv.markInProgress(1, testRepo)
+	_ = srv.scaleUp(ctx, 2, testRepo)
+	srv.markInProgress(2, testRepo)
 
 	callsBefore := len(client.allCalls()) // scaleUp(2) already made one call
 	if err := srv.scaleDown(ctx, 1); err != nil {
@@ -266,8 +275,8 @@ func TestScaleDown_WaitsForRemainingInProgressJobs(t *testing.T) {
 
 func TestMarkInProgress_MovesJobFromQueuedToInProgress(t *testing.T) {
 	srv, _ := newTestServer(6, time.Hour, testClock)
-	_ = srv.scaleUp(context.Background(), 1)
-	srv.markInProgress(1)
+	_ = srv.scaleUp(context.Background(), 1, testRepo)
+	srv.markInProgress(1, testRepo)
 
 	srv.state.mu.Lock()
 	defer srv.state.mu.Unlock()
@@ -293,7 +302,7 @@ func TestScaling_AppliersDoNotOverlap(t *testing.T) {
 		wg.Add(1)
 		go func(id int64) {
 			defer wg.Done()
-			_ = srv.scaleUp(context.Background(), id)
+			_ = srv.scaleUp(context.Background(), id, testRepo)
 		}(id)
 	}
 	wg.Wait()
@@ -308,7 +317,7 @@ func TestScaling_AppliersDoNotOverlap(t *testing.T) {
 
 func TestMarkInProgress_IgnoresJobNotQueued(t *testing.T) {
 	srv, _ := newTestServer(6, time.Hour, testClock)
-	srv.markInProgress(999) // never queued
+	srv.markInProgress(999, testRepo) // never queued
 
 	srv.state.mu.Lock()
 	_, present := srv.state.inProgress[999]
@@ -326,15 +335,15 @@ func TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject(t *testing.T) {
 	srv, _ := newTestServer(6, time.Hour, testClock)
 	ctx := context.Background()
 
-	if err := srv.scaleUp(ctx, 100); err != nil {
+	if err := srv.scaleUp(ctx, 100, testRepo); err != nil {
 		t.Fatalf("scaleUp(100): %v", err)
 	}
-	srv.markInProgress(100)
+	srv.markInProgress(100, testRepo)
 	if err := srv.scaleDown(ctx, 100); err != nil { // completes; batch settles; state empty
 		t.Fatalf("scaleDown(100): %v", err)
 	}
 
-	srv.markInProgress(100) // late/retried in_progress for the finished job
+	srv.markInProgress(100, testRepo) // late/retried in_progress for the finished job
 
 	srv.state.mu.Lock()
 	_, present := srv.state.inProgress[100]
@@ -357,13 +366,13 @@ func TestScaleDown_CancelledWhileQueued_DoesNotLeak(t *testing.T) {
 	ctx := context.Background()
 
 	// Job 1 starts running.
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp(1): %v", err)
 	}
-	srv.markInProgress(1)
+	srv.markInProgress(1, testRepo)
 
 	// Job 2 is queued behind it, then cancelled before it ever runs.
-	if err := srv.scaleUp(ctx, 2); err != nil {
+	if err := srv.scaleUp(ctx, 2, testRepo); err != nil {
 		t.Fatalf("scaleUp(2): %v", err)
 	}
 	if err := srv.scaleDown(ctx, 2); err != nil {
@@ -410,14 +419,14 @@ func TestScaleDown_RepeatedCancelWhileQueued_NeverLeaksAcrossManyBatches(t *test
 	for i := 0; i < 20; i++ {
 		running := nextID
 		nextID++
-		if err := srv.scaleUp(ctx, running); err != nil {
+		if err := srv.scaleUp(ctx, running, testRepo); err != nil {
 			t.Fatalf("iteration %d: scaleUp(running=%d): %v", i, running, err)
 		}
-		srv.markInProgress(running)
+		srv.markInProgress(running, testRepo)
 
 		cancelled := nextID
 		nextID++
-		if err := srv.scaleUp(ctx, cancelled); err != nil {
+		if err := srv.scaleUp(ctx, cancelled, testRepo); err != nil {
 			t.Fatalf("iteration %d: scaleUp(cancelled=%d): %v", i, cancelled, err)
 		}
 		if err := srv.scaleDown(ctx, cancelled); err != nil {
@@ -492,7 +501,7 @@ func TestReapStaleJobs_PurgesEntriesOlderThanTTL(t *testing.T) {
 	ctx := context.Background()
 
 	srv.state.mu.Lock()
-	srv.state.queued[99] = testClock().Add(-2 * time.Hour) // older than the 1h TTL
+	srv.state.queued[99] = jobEntry{since: testClock().Add(-2 * time.Hour), repo: testRepo} // older than the 1h TTL
 	srv.state.mu.Unlock()
 
 	srv.reapStaleJobs(ctx)
@@ -515,7 +524,7 @@ func TestReapStaleJobs_LeavesFreshEntriesAlone(t *testing.T) {
 	ctx := context.Background()
 
 	srv.state.mu.Lock()
-	srv.state.queued[7] = testClock().Add(-5 * time.Minute) // well under the 1h TTL
+	srv.state.queued[7] = jobEntry{since: testClock().Add(-5 * time.Minute), repo: testRepo} // well under the 1h TTL
 	srv.state.mu.Unlock()
 
 	srv.reapStaleJobs(ctx)
@@ -536,15 +545,15 @@ func TestReapStaleJobs_DoesNotTouchReplicasWhileOtherJobInProgress(t *testing.T)
 	ctx := context.Background()
 
 	// Job 1 is genuinely running right now (fresh timestamp).
-	if err := srv.scaleUp(ctx, 1); err != nil {
+	if err := srv.scaleUp(ctx, 1, testRepo); err != nil {
 		t.Fatalf("scaleUp(1): %v", err)
 	}
-	srv.markInProgress(1)
+	srv.markInProgress(1, testRepo)
 
 	// Job 2 has been stuck in queued for 2h - e.g. a lost webhook delivery for
 	// its terminal event.
 	srv.state.mu.Lock()
-	srv.state.queued[2] = testClock().Add(-2 * time.Hour)
+	srv.state.queued[2] = jobEntry{since: testClock().Add(-2 * time.Hour), repo: testRepo}
 	srv.state.mu.Unlock()
 
 	// scaleUp(1) legitimately asserted a count already, so the guarantee under
@@ -577,8 +586,8 @@ func TestReapStaleJobs_PurgesStaleInProgressEntryButKeepsFreshOne(t *testing.T) 
 	ctx := context.Background()
 
 	srv.state.mu.Lock()
-	srv.state.inProgress[1] = testClock()                     // fresh: just started
-	srv.state.inProgress[2] = testClock().Add(-2 * time.Hour) // stale: past the 1h TTL
+	srv.state.inProgress[1] = jobEntry{since: testClock(), repo: testRepo}                     // fresh: just started
+	srv.state.inProgress[2] = jobEntry{since: testClock().Add(-2 * time.Hour), repo: testRepo} // stale: past the 1h TTL
 	srv.state.mu.Unlock()
 
 	srv.reapStaleJobs(ctx)

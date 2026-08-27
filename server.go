@@ -23,11 +23,20 @@ const (
 type WorkflowJobEvent struct {
 	Action      string      `json:"action"`
 	WorkflowJob WorkflowJob `json:"workflow_job"`
+	// Repository is the repo the job belongs to. Every repository-scoped GitHub
+	// webhook carries it, and reconcile cannot ask GitHub about a job id without
+	// it: the job endpoint is repo-scoped, and a job id queried against the wrong
+	// repo returns 404 (verified against the live API).
+	Repository Repository `json:"repository"`
 }
 
 type WorkflowJob struct {
 	ID     int64    `json:"id"`
 	Labels []string `json:"labels"`
+}
+
+type Repository struct {
+	FullName string `json:"full_name"`
 }
 
 type gqlRequest struct {
@@ -86,6 +95,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	log.Printf("webhook received: action=%s labels=%v", event.Action, event.WorkflowJob.Labels)
 
 	id := event.WorkflowJob.ID
+	repo := event.Repository.FullName
 	// Scaling side-effects run on a background context with their own deadline,
 	// so a GitHub delivery connection that drops after the job state was already
 	// recorded can't cancel the scale mid-flight. Non-scaling actions ignore it.
@@ -93,13 +103,13 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	switch event.Action {
 	case "queued":
-		if err := s.scaleUp(scaleCtx, id); err != nil {
+		if err := s.scaleUp(scaleCtx, id, repo); err != nil {
 			log.Printf("scale up error: %v", err)
 			http.Error(w, "failed to scale up", http.StatusInternalServerError)
 			return
 		}
 	case "in_progress":
-		s.markInProgress(id)
+		s.markInProgress(id, repo)
 	case "completed":
 		// completed is GitHub's only terminal workflow_job action: it fires whether
 		// the job ran to completion, failed, or was cancelled before ever starting
@@ -145,33 +155,70 @@ func hasLabels(jobLabels, required []string) bool {
 	return true
 }
 
-func (s *Server) markInProgress(id int64) {
+// markInProgress moves a job from queued to inProgress, and — when reconcile is
+// available to bound the cost — adopts one it never saw queued.
+//
+// The refusal to adopt was correct while a phantom could only be cleared by the
+// StaleJobTTL reaper: an in_progress redelivered after the job had already
+// completed would have pinned a replica for 7 hours. But refusing has its own
+// cost, and it is the worse one. A job whose `queued` delivery was lost runs to
+// completion in NO set at all: live, occupying a replica, invisible. Nothing
+// counts it, so nothing holds a floor for it, and the next decision that finds
+// the counters empty scales the fleet down on top of it.
+//
+// Until now that job was protected only by accident — by the very leak this card
+// removes, which happened to hold the fleet up for longer than GitHub's own
+// default job timeout. Clearing leaks within one tick takes that accident away,
+// so the untracked job has to be made visible deliberately instead.
+//
+// Reconcile is what makes adoption safe: an adopted phantom is checked against
+// GitHub within one tick and retired if it really had finished. That trades an
+// UNRECOVERABLE error (cancelling a running job) for a RECOVERABLE one (one
+// spare replica for at most one cycle). With no GitHub client the old trade is
+// still the right one and the old behaviour stands unchanged.
+func (s *Server) markInProgress(id int64, repo string) {
 	s.state.mu.Lock()
 	if _, queued := s.state.queued[id]; !queued {
-		// in_progress only legitimately follows a queued we recorded. If the id
-		// isn't queued it's a late, duplicate, or out-of-order delivery - most
-		// importantly an in_progress retried after the job already completed and
-		// was deleted from every set. Ignore it rather than resurrecting a phantom
-		// in-progress job, which would hold the fleet above its idle baseline
-		// until the TTL reaper cleaned it up.
+		if s.github == nil || repo == "" {
+			// No way to bound a phantom's lifetime, so keep refusing: a late or
+			// retried in_progress for an already-completed job would otherwise
+			// hold the fleet above its idle baseline until the TTL reaper.
+			s.state.mu.Unlock()
+			log.Printf("in_progress ignored: job %d is not queued (late or out-of-order webhook)", id)
+			return
+		}
+		s.state.inProgress[id] = jobEntry{since: s.clock(), repo: repo, seq: s.state.nextSeq()}
+		inProgress := len(s.state.inProgress)
 		s.state.mu.Unlock()
-		log.Printf("in_progress ignored: job %d is not queued (late or out-of-order webhook)", id)
+		log.Printf("job adopted: id=%d in %s reported in_progress without a queued this process saw; "+
+			"tracking it so no scale decision shrinks the fleet under it (inProgress=%d). Reconcile "+
+			"retires it within one cycle if GitHub says it has already finished", id, repo, inProgress)
 		return
 	}
+	// Carry the entry across rather than rebuilding it, so `repo` survives the
+	// move — reconcile cannot ask GitHub about an id it has no repository for.
+	// `since` is deliberately reset: the TTL horizon measures how long a job has
+	// been in its CURRENT state, so a job that queued for hours gets a full
+	// horizon once it actually starts running. `seq` is renewed because this is a
+	// new insertion, and a reconcile lookup issued against the queued entry must
+	// not commit against the inProgress one.
+	entry := s.state.queued[id]
 	delete(s.state.queued, id)
-	s.state.inProgress[id] = s.clock()
+	entry.since = s.clock()
+	entry.seq = s.state.nextSeq()
+	s.state.inProgress[id] = entry
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
 	log.Printf("job in progress: id=%d queued=%d inProgress=%d", id, queued, inProgress)
 }
 
-func (s *Server) scaleUp(ctx context.Context, id int64) error {
+func (s *Server) scaleUp(ctx context.Context, id int64, repo string) error {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
 
 	s.state.mu.Lock()
-	s.state.queued[id] = s.clock()
+	s.state.queued[id] = jobEntry{since: s.clock(), repo: repo, seq: s.state.nextSeq()}
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
@@ -301,6 +348,12 @@ func (s *Server) apply(ctx context.Context, queued, inProgress int) (int, error)
 	return next, nil
 }
 
+// nextSeq returns a fresh entry identity. Callers must hold state.mu.
+func (st *State) nextSeq() uint64 {
+	st.seq++
+	return st.seq
+}
+
 // reapLoop runs the background tick until ctx is cancelled.
 func (s *Server) reapLoop(ctx context.Context) {
 	every := s.tickInterval
@@ -324,6 +377,17 @@ func (s *Server) reapLoop(ctx context.Context) {
 // Both halves are needed — the reap alone cannot revive a fleet, and the assert
 // alone cannot clear a phantom.
 func (s *Server) tick(ctx context.Context) {
+	// Reconcile gets its own deadline so a slow or hanging GitHub cannot eat the
+	// tick that reapStaleJobs and assertDesired need. See reconcileBudget: those
+	// two must keep their cadence even — especially — when GitHub is degraded.
+	budget := s.reconcileBudget
+	if budget == 0 {
+		budget = reconcileBudget
+	}
+	rctx, cancel := context.WithTimeout(ctx, budget)
+	s.reconcile(rctx)
+	cancel()
+
 	s.reapStaleJobs(ctx)
 	s.assertDesired(ctx)
 }
@@ -343,14 +407,14 @@ func (s *Server) reapStaleJobs(ctx context.Context) {
 	now := s.clock()
 	s.state.mu.Lock()
 	var reaped []int64
-	for id, t := range s.state.queued {
-		if now.Sub(t) > s.cfg.StaleJobTTL {
+	for id, e := range s.state.queued {
+		if now.Sub(e.since) > s.cfg.StaleJobTTL {
 			delete(s.state.queued, id)
 			reaped = append(reaped, id)
 		}
 	}
-	for id, t := range s.state.inProgress {
-		if now.Sub(t) > s.cfg.StaleJobTTL {
+	for id, e := range s.state.inProgress {
+		if now.Sub(e.since) > s.cfg.StaleJobTTL {
 			delete(s.state.inProgress, id)
 			reaped = append(reaped, id)
 		}
