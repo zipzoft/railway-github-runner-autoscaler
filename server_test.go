@@ -57,9 +57,16 @@ func (f *fakeRailwayClient) SetReplicas(ctx context.Context, n int) error {
 }
 
 // Replicas reports the fleet size Railway would return at boot. The zero value
-// means "Railway has no replicas configured", which seeds an unconstrained floor
-// — the right default for the tests that exercise the ramp from an idle fleet.
+// stands in for an idle fleet, giving the tests that exercise the ramp a floor
+// of 1. Note the production client never returns 0: Railway reports null for a
+// service with no replica override, and railwayClient.Replicas turns that into
+// an error precisely so it is not read as "idle".
 func (f *fakeRailwayClient) Replicas(ctx context.Context) (int, error) {
+	if f.respectCtx {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.replicas, f.replicasErr
@@ -172,7 +179,7 @@ func TestValidateHMAC(t *testing.T) {
 // --- scaling state machine ---
 
 // The first-job case is covered by
-// TestScaleUp_ColdStartAssertsReplicaCountRatherThanAssumingBaseReplica in
+// TestScaleUp_ColdStartAssertsWithoutShrinkingAPossiblyLiveFleet in
 // deadlock_test.go. It used to assert the opposite — that the first job after
 // boot makes no API call because a base replica is already there — which is the
 // assumption ATT-482 falsified: the fleet had zero live runners and nothing

@@ -237,22 +237,30 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 //  2. While any job is outstanding the count never goes DOWN. Railway is free to
 //     drop any replica when numReplicas shrinks, including one mid-job, so
 //     neither a newly-queued job nor a restart of this process may shrink a fleet
-//     that is still working. state.applied is that floor, seeded at the cap on
-//     boot (see main) and released only when queued+inProgress reaches zero —
-//     the one moment this process knows the fleet is idle.
+//     that is still working. state.applied is that floor, seeded from Railway's
+//     live count at boot (see seedFloor, with the cap as the fallback). It is
+//     released only on an observed drain — queued+inProgress reaching zero
+//     AFTER this process has tracked work — because a zero count straight after
+//     boot means this process knows nothing, not that the fleet is idle.
 //
 //  3. An unchanged count is re-pushed, but not more often than coalesceWindow.
 //     Re-asserting is what revives a fleet whose replicas died unobserved, so it
 //     cannot be skipped outright; issuing it on all 30 webhooks of a burst,
 //     serialized behind scaleMu, would push the last delivery past GitHub's
-//     timeout. assertOutstanding covers the suppressed window.
+//     timeout. assertDesired covers the suppressed window.
 //
 // Callers must hold scaleMu.
 func (s *Server) apply(ctx context.Context, queued, inProgress int) (int, error) {
 	next := max(1, min(queued+inProgress, s.cfg.MaxRunners))
 
 	s.state.mu.Lock()
-	if queued+inProgress > 0 && next < s.state.applied {
+	if queued+inProgress > 0 {
+		s.state.observedWork = true
+	}
+	// Hold the floor while work is outstanding, and also while this process has
+	// never seen any: a zero count straight after boot is ignorance, not
+	// evidence that the fleet is idle.
+	if (queued+inProgress > 0 || !s.state.observedWork) && next < s.state.applied {
 		next = s.state.applied
 	}
 	unchanged := next == s.state.applied
@@ -296,12 +304,12 @@ func (s *Server) reapLoop(ctx context.Context) {
 }
 
 // tick is one pass of the background loop: purge entries whose terminal webhook
-// never arrived, then re-assert the replica count if any work is still
-// outstanding. Both halves are needed — the reap alone cannot revive a fleet,
-// and the assert alone cannot clear a phantom.
+// never arrived, then re-assert the replica count the remaining work implies.
+// Both halves are needed — the reap alone cannot revive a fleet, and the assert
+// alone cannot clear a phantom.
 func (s *Server) tick(ctx context.Context) {
 	s.reapStaleJobs(ctx)
-	s.assertOutstanding(ctx)
+	s.assertDesired(ctx)
 }
 
 // reapStaleJobs is a defense-in-depth safety net, not the primary leak fix
@@ -353,24 +361,29 @@ func (s *Server) reapStaleJobs(ctx context.Context) {
 	log.Printf("reap: replicas set to %d after stale-job cleanup (queued=%d)", next, queued)
 }
 
-// assertOutstanding re-pushes the replica count while any job is outstanding, so
-// recovery never depends on another webhook arriving. Webhooks fire on job state
-// CHANGES, and a queued job that no runner ever picks up has no further state to
-// change: if the fleet dies after the last job was queued, nothing else would
-// ever call apply and the backlog would sit until StaleJobTTL (6h by default).
-// This is what makes the no-deadlock guarantee unconditional rather than
-// dependent on CI staying busy, and it is why coalescing repeat pushes in apply
-// is safe.
-func (s *Server) assertOutstanding(ctx context.Context) {
+// assertDesired re-pushes the replica count the tracked work implies, in either
+// direction, so neither correction depends on a webhook arriving.
+//
+// Up: webhooks fire on job state CHANGES, and a queued job that no runner ever
+// picks up has no further state to change. Without this, a fleet that died after
+// the last job was queued sat until StaleJobTTL. This is what makes the
+// no-deadlock guarantee unconditional instead of dependent on CI staying busy.
+//
+// Down: a scale-down push that fails leaves applied stale-high on purpose (see
+// apply), and nothing else would ever retry it — the batch is over, so no
+// further webhook will call apply. Left alone that bills a full-width fleet
+// until the next batch happens to drain successfully.
+func (s *Server) assertDesired(ctx context.Context) {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
 
 	s.state.mu.Lock()
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
+	overProvisioned := s.state.applied > 1 && s.state.observedWork
 	s.state.mu.Unlock()
 
-	if queued+inProgress == 0 {
+	if queued+inProgress == 0 && !overProvisioned {
 		return
 	}
 
@@ -380,6 +393,32 @@ func (s *Server) assertOutstanding(ctx context.Context) {
 		return
 	}
 	log.Printf("periodic assert: replicas=%d (queued=%d inProgress=%d)", next, queued, inProgress)
+}
+
+// seedFloorOnce refines the replica floor from Railway's live count, but only
+// while nothing has been pushed yet. It runs concurrently with the HTTP server
+// so a slow or hung Railway backend cannot delay the listener binding and fail
+// the deploy healthcheck, and it holds scaleMu so it cannot interleave with a
+// scale decision: a webhook arriving first simply waits, and one that already
+// pushed keeps its value rather than having the pre-boot count overwrite it.
+func (s *Server) seedFloorOnce(ctx context.Context) {
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
+	s.state.mu.Lock()
+	pushed := !s.state.lastPush.IsZero()
+	s.state.mu.Unlock()
+	if pushed {
+		log.Printf("floor seed skipped: a scale decision already ran")
+		return
+	}
+
+	floor := seedFloor(ctx, s.client, s.cfg.MaxRunners)
+
+	s.state.mu.Lock()
+	s.state.applied = floor
+	s.state.mu.Unlock()
+	log.Printf("replica floor seeded at %d from Railway", floor)
 }
 
 // railwayClient is the production RailwayClient: it calls Railway's GraphQL

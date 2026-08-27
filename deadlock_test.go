@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -22,8 +23,8 @@ import (
 // inProgress entries that will never receive a terminal webhook.
 // newTestServerWithLiveFleet mirrors production boot against a Railway that
 // already has `live` replicas configured — the state a restart lands in when it
-// happens mid-batch. seedFloor is re-run because the floor is seeded at boot
-// from exactly this read.
+// happens mid-batch, and the state in which pushing a low count cancels jobs.
+// seedFloor is re-run because that read is exactly how boot sets the floor.
 func newTestServerWithLiveFleet(maxRunners, live int, ttl time.Duration, clock func() time.Time) (*Server, *fakeRailwayClient) {
 	srv, client := newTestServer(maxRunners, ttl, clock)
 	client.replicas = live
@@ -33,6 +34,8 @@ func newTestServerWithLiveFleet(maxRunners, live int, ttl time.Duration, clock f
 	return srv, client
 }
 
+// seedStuckFleet plants `stuck` phantom inProgress entries: jobs whose terminal
+// webhook was lost, so nothing but the TTL reaper will ever retire them.
 func seedStuckFleet(srv *Server, stuck int) {
 	srv.state.mu.Lock()
 	defer srv.state.mu.Unlock()
@@ -80,8 +83,8 @@ func TestScaleUp_BacklogOverMaxStillAssertsCap(t *testing.T) {
 }
 
 // A phantom inProgress entry pins scaleDown's early return forever, so
-// applyAndClear never runs. Any per-job bookkeeping that only applyAndClear
-// clears therefore grows without bound — in production it reached 5972 entries
+// the end-of-batch apply never runs. Any per-job bookkeeping that only that
+// path clears therefore grows without bound — in production it reached 5972 entries
 // and, because it was summed into the scale-up total, held total permanently
 // ~1000x above MaxRunners.
 func TestScaleDown_CompletedJobsNeitherAccumulateNorInflateDesiredCount(t *testing.T) {
@@ -149,23 +152,53 @@ func TestScaleUp_ColdStartAssertsWithoutShrinkingAPossiblyLiveFleet(t *testing.T
 	}
 }
 
-// The floor must release itself, or a restart would pin the fleet at the cap
-// forever and bill six idle runners. A genuine drain — nothing queued, nothing
-// in progress — is the one moment this process knows shrinking is safe.
-func TestApply_FloorReleasesOnGenuineDrain(t *testing.T) {
-	srv, client := newTestServer(6, time.Hour, testClock)
+// The floor must release itself, or a restart would pin the fleet at its boot
+// width forever and bill idle runners. A drain this process actually WATCHED —
+// work tracked, then gone — is the one moment shrinking is known to be safe.
+//
+// The fixture boots against a live fleet of 6 so there is a floor worth
+// releasing: with the default fixture the floor is already 1 and this test
+// cannot fail.
+func TestApply_FloorReleasesOnAnObservedDrain(t *testing.T) {
+	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
 	ctx := context.Background()
 
 	if err := srv.scaleUp(ctx, 1); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
 	srv.markInProgress(1)
+	if last, _ := client.lastCall(); last != 6 {
+		t.Fatalf("expected the floor held at 6 while the job runs, got %d", last)
+	}
+
 	if err := srv.scaleDown(ctx, 1); err != nil {
 		t.Fatalf("scaleDown: %v", err)
 	}
 
 	if last, ok := client.lastCall(); !ok || last != 1 {
-		t.Fatalf("expected the fleet released to 1 replica once fully drained, got %d (ok=%v)", last, ok)
+		t.Fatalf("expected the fleet released to 1 replica after an observed drain, got %d (ok=%v)", last, ok)
+	}
+}
+
+// The mirror image, and the hole the first rework left open: after a restart the
+// counters are empty too, but that is ignorance, not an observed drain. The
+// first `completed` webhook is routinely for a job this process never tracked —
+// scaleDown deletes an id from neither map, both counts read zero, and treating
+// that as "idle" pushes SetReplicas(1) at a fleet six jobs deep.
+func TestApply_EmptyCountsAfterBootAreNotAnObservedDrain(t *testing.T) {
+	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
+
+	// A terminal webhook for a job from before this process existed.
+	if err := srv.scaleDown(context.Background(), 999); err != nil {
+		t.Fatalf("scaleDown: %v", err)
+	}
+
+	for _, n := range client.allCalls() {
+		if n < 6 {
+			t.Fatalf("pushed %d at a fleet of 6 whose jobs this process never tracked; an empty "+
+				"count right after boot is ignorance, not evidence the fleet is idle (calls=%v)",
+				n, client.allCalls())
+		}
 	}
 }
 
@@ -218,7 +251,7 @@ func TestApply_NeverShrinksTheFleetWhileAJobIsStillRunning(t *testing.T) {
 // state CHANGES; a queued job that no runner ever picks up has no further state
 // to change. If the fleet dies after the last job was queued, nothing else
 // would call apply and the backlog would sit until the 6h TTL.
-func TestAssertOutstanding_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t *testing.T) {
+func TestAssertDesired_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t *testing.T) {
 	now := testClock()
 	clock := func() time.Time { return now }
 	srv, client := newTestServer(6, time.Hour, clock)
@@ -231,7 +264,7 @@ func TestAssertOutstanding_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t
 
 	// No further webhooks ever arrive; only the reap loop ticks.
 	now = now.Add(reapInterval)
-	srv.assertOutstanding(ctx)
+	srv.assertDesired(ctx)
 
 	after := client.allCalls()
 	if len(after) == before {
@@ -244,7 +277,7 @@ func TestAssertOutstanding_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t
 }
 
 // The background loop must actually be wired to the assert: a mutation that
-// dropped assertOutstanding from the tick left the rest of the suite green,
+// dropped assertDesired from the tick left the rest of the suite green,
 // because the other tests call it directly.
 func TestReapLoop_TickRepushesOutstandingWorkWithoutAnyWebhook(t *testing.T) {
 	now := testClock()
@@ -275,11 +308,11 @@ func TestReapLoop_TickRepushesOutstandingWorkWithoutAnyWebhook(t *testing.T) {
 		"recovery still depends on a webhook arriving (calls=%v)", client.allCalls())
 }
 
-// Nothing outstanding means nothing to assert — the periodic path must not churn
-// Railway on an idle fleet.
-func TestAssertOutstanding_SilentWhenNothingIsOutstanding(t *testing.T) {
+// Nothing outstanding and already at the baseline means nothing to correct — the
+// periodic path must not churn Railway on an idle fleet.
+func TestAssertDesired_SilentWhenIdleAndAlreadyAtBaseline(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
-	srv.assertOutstanding(context.Background())
+	srv.assertDesired(context.Background())
 	if _, ok := client.lastCall(); ok {
 		t.Fatalf("idle fleet must not be re-pushed")
 	}
@@ -288,7 +321,7 @@ func TestAssertOutstanding_SilentWhenNothingIsOutstanding(t *testing.T) {
 // Asserting on every webhook is what breaks the deadlock, but issuing one
 // serialized Railway mutation per webhook pushes the tail of a 30-job burst past
 // GitHub's delivery timeout. An unchanged count within coalesceWindow is
-// therefore suppressed — and assertOutstanding covers the suppressed window.
+// therefore suppressed — and assertDesired covers the suppressed window.
 func TestApply_CoalescesUnchangedPushesWithinTheWindow(t *testing.T) {
 	now := testClock()
 	clock := func() time.Time { return now }
@@ -347,5 +380,42 @@ func TestReapStaleJobs_ClearsPhantomsAndReturnsFleetToBaseline(t *testing.T) {
 	}
 	if last, ok := client.lastCall(); !ok || last != 1 {
 		t.Fatalf("expected fleet returned to 1 replica after reap, got %d (ok=%v)", last, ok)
+	}
+}
+
+// A scale-down push that fails leaves applied stale-high on purpose, and the
+// batch is over — no further webhook will call apply. Without the idle branch of
+// assertDesired nothing ever retries the contraction, and a bursty repo bills a
+// full-width fleet until the next batch happens to drain cleanly.
+func TestAssertDesired_RetriesAContractionThatFailed(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, clock)
+	ctx := context.Background()
+
+	if err := srv.scaleUp(ctx, 1); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	srv.markInProgress(1)
+
+	// The contraction at the end of the batch fails.
+	client.err = fmt.Errorf("railway down")
+	if err := srv.scaleDown(ctx, 1); err == nil {
+		t.Fatal("expected the failed contraction to surface")
+	}
+	srv.state.mu.Lock()
+	applied := srv.state.applied
+	srv.state.mu.Unlock()
+	if applied != 6 {
+		t.Fatalf("a failed push must leave the floor stale-high, got %d", applied)
+	}
+
+	// Railway recovers. Nothing is queued and no webhook will arrive.
+	client.err = nil
+	now = now.Add(2 * coalesceWindow)
+	srv.assertDesired(ctx)
+
+	if last, ok := client.lastCall(); !ok || last != 1 {
+		t.Fatalf("expected the idle fleet contracted to 1 on retry, got %d (ok=%v)", last, ok)
 	}
 }
