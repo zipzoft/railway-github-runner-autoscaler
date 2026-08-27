@@ -29,6 +29,10 @@ const (
 	// does not depend on the suppressed calls: assertOutstanding re-pushes every
 	// reapInterval for as long as any job is outstanding.
 	coalesceWindow = 30 * time.Second
+	// seedTimeout bounds the boot-time replica read. It runs before the HTTP
+	// listener binds, so it must stay comfortably inside the deploy healthcheck
+	// budget (the service is configured with healthcheckTimeout: 10).
+	seedTimeout = 5 * time.Second
 )
 
 type Config struct {
@@ -193,7 +197,13 @@ func main() {
 
 	client := newRailwayClient(cfg)
 
-	seedCtx, seedCancel := context.WithTimeout(ctx, 15*time.Second)
+	// Bounded well under the service's healthcheck timeout: this read happens
+	// BEFORE the listener binds, so a slow Railway backend would otherwise delay
+	// the port opening past the healthcheck and fail the deploy. Timing out here
+	// is not a failure — seedFloor falls back to the cap, which is the safe
+	// direction. Webhooks cannot be missed during the wait either: nothing is
+	// listening yet, so GitHub retries the delivery.
+	seedCtx, seedCancel := context.WithTimeout(ctx, seedTimeout)
 	floor := seedFloor(seedCtx, client, cfg.MaxRunners)
 	seedCancel()
 
