@@ -431,3 +431,33 @@ func TestAssertDesired_RetriesAContractionThatFailed(t *testing.T) {
 		t.Fatalf("expected the idle fleet contracted to 1 on retry, got %d (ok=%v)", last, ok)
 	}
 }
+
+// While the boot-era floor is what pins the fleet, there is nothing to correct:
+// the periodic assert must stay silent rather than re-push the pinned value once
+// per tick for the whole horizon. That churn is wasteful on its own, and each
+// push is another bet on `serviceInstanceUpdate` being inert.
+func TestAssertDesired_SilentWhileTheBootFloorIsWhatHoldsTheFleet(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	ttl := 7 * time.Hour
+	srv, client := newTestServerWithLiveFleet(6, 6, ttl, clock)
+	ctx := context.Background()
+
+	// Ticks strictly inside the horizon (7h / 5min = 84, so 83 stays inside).
+	for i := 0; i < 83; i++ {
+		now = now.Add(reapInterval)
+		srv.tick(ctx)
+	}
+
+	if n := len(client.allCalls()); n > 0 {
+		t.Fatalf("%d Railway pushes while idle and pinned by the boot floor; nothing was "+
+			"correctable, so nothing should have been pushed (calls=%v)", n, client.allCalls())
+	}
+
+	// And the moment the horizon lapses the fleet must actually contract.
+	now = now.Add(2 * reapInterval)
+	srv.tick(ctx)
+	if last, ok := client.lastCall(); !ok || last != 1 {
+		t.Fatalf("expected contraction to 1 after the horizon, got %d (ok=%v)", last, ok)
+	}
+}

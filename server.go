@@ -384,10 +384,16 @@ func (s *Server) assertDesired(ctx context.Context) {
 	s.state.mu.Lock()
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
-	overProvisioned := s.state.applied > 1
+	// The count is only worth correcting downward if something other than the
+	// boot-era floor is holding it up. While that floor is what pins the fleet,
+	// re-pushing the value it pins achieves nothing and would issue one Railway
+	// mutation per tick for the whole horizon — needless churn, and needless
+	// exercise of the assumption that an unchanged update is inert.
+	bootHeld := s.clock().Before(s.state.bootFloorUntil) && s.state.bootFloor >= s.state.applied
+	contractable := s.state.applied > 1 && !bootHeld
 	s.state.mu.Unlock()
 
-	if queued+inProgress == 0 && !overProvisioned {
+	if queued+inProgress == 0 && !contractable {
 		return
 	}
 
