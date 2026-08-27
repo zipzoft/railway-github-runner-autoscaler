@@ -930,3 +930,57 @@ func TestReconcile_KeepsCompletionsAlreadyConfirmedWhenARateLimitCutsTheCycleSho
 		t.Fatalf("pruned job 2, whose lookup was refused — a rate limit is not a completion")
 	}
 }
+
+// TestEndToEnd_ALostCompletedWebhookClearsInOneTickInsteadOfSevenHours drives the
+// whole card through the real webhook handler rather than hand-planted state.
+// ATT-482 was hidden for a full review round by a fixture that built State by
+// hand while production used a constructor, so the scenario that matters is
+// worth asserting the way production actually reaches it.
+func TestEndToEnd_ALostCompletedWebhookClearsInOneTickInsteadOfSevenHours(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, rail := newTestServerWithLiveFleet(6, 1, 7*time.Hour, clock)
+	gh := &fakeGitHubClient{answers: map[int64]jobLiveness{}}
+	srv.github = gh
+	srv.state.mu.Lock()
+	srv.state.bootFloorUntil = now.Add(-time.Minute) // a long-running process
+	srv.state.mu.Unlock()
+
+	// Two jobs arrive and start, exactly as GitHub delivers them.
+	postWebhook(srv, "queued", 101)
+	postWebhook(srv, "queued", 102)
+	postWebhook(srv, "in_progress", 101)
+	postWebhook(srv, "in_progress", 102)
+	if last, _ := rail.lastCall(); last != 2 {
+		t.Fatalf("fleet scaled to %d for two concurrent jobs, want 2", last)
+	}
+
+	// 101 completes normally. 102 completes too — but its delivery is LOST, so no
+	// webhook ever arrives for it. That id now holds a replica, and before this
+	// change nothing but the 7h reaper would ever release it.
+	now = now.Add(time.Minute)
+	postWebhook(srv, "completed", 101)
+
+	if q, ip := trackedCount(srv); q != 0 || ip != 1 {
+		t.Fatalf("expected exactly the leaked id to remain, got queued=%d inProgress=%d", q, ip)
+	}
+	if last, _ := rail.lastCall(); last < 2 {
+		t.Fatalf("fleet contracted to %d while a job was still believed in progress", last)
+	}
+
+	// One tick later, GitHub is asked and answers truthfully.
+	gh.answers[102] = jobFinished
+	now = now.Add(time.Minute)
+	srv.tick(context.Background())
+
+	if q, ip := trackedCount(srv); q != 0 || ip != 0 {
+		t.Fatalf("the leak survived a reconcile cycle: queued=%d inProgress=%d", q, ip)
+	}
+	if last, ok := rail.lastCall(); !ok || last != 1 {
+		t.Fatalf("fleet at %d after the leak cleared, want 1; calls %v", last, rail.allCalls())
+	}
+	// And the elapsed time is one tick, not the TTL horizon.
+	if elapsed := now.Sub(testClock()); elapsed > 10*time.Minute {
+		t.Fatalf("took %s of simulated time; the point is that it beats the %s horizon", elapsed, srv.cfg.StaleJobTTL)
+	}
+}
