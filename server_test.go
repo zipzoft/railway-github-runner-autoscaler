@@ -140,6 +140,22 @@ func postWebhook(srv *Server, action string, id int64) *httptest.ResponseRecorde
 	return rec
 }
 
+// postRawWebhook signs and delivers a caller-supplied payload, for the cases
+// postWebhook's fixed shape cannot express — a different repository, or a
+// malformed one.
+func postRawWebhook(srv *Server, body []byte) *httptest.ResponseRecorder {
+	mac := hmac.New(sha256.New, []byte(srv.cfg.WebhookSecret))
+	mac.Write(body)
+	sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	srv.handleWebhook(rec, req)
+	return rec
+}
+
 // --- pure helper functions ---
 
 func TestHasLabels(t *testing.T) {
@@ -331,7 +347,11 @@ func TestMarkInProgress_IgnoresJobNotQueued(t *testing.T) {
 // out-of-order delivery the guard exists for: a retried in_progress arrives
 // after the job already completed and the batch settled (which clears the
 // completed set). The id must stay out of inProgress, not leak until the reaper.
-func TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject(t *testing.T) {
+// Named for the configuration it covers: with no GitHub client there is nothing
+// to bound a phantom, so a late in_progress must stay refused. The opposite is
+// true once reconcile is available — see
+// TestMarkInProgress_LateWebhookAfterCompleteIsReinjectedButRetiredWithinOneCycle.
+func TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinjectWithoutReconcile(t *testing.T) {
 	srv, _ := newTestServer(6, time.Hour, testClock)
 	ctx := context.Background()
 

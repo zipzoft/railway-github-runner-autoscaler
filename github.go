@@ -34,9 +34,11 @@ const (
 //
 // repo is the "owner/name" the job belongs to, taken from the webhook payload:
 // GitHub's job endpoint is repo-scoped, so without it an id cannot be looked up
-// at all. It is empty for any entry planted before this field existed, and
-// reconcile skips those rather than guessing a repo — guessing would produce a
-// 404, and a 404 is exactly the answer that must never be read as "finished".
+// at all. It is empty only when the payload carried no usable
+// `repository.full_name` (State is in-memory, so there is no older persisted
+// entry it could come from), and reconcile skips those rather than guessing —
+// guessing would produce a 404, and a 404 is the one answer that must never be
+// read as "finished".
 //
 // seq identifies this particular tracked-ness of the id, and exists ONLY so
 // reconcile's commit can tell "the entry I asked GitHub about" from "an entry a
@@ -191,7 +193,11 @@ func (s *Server) noteBlindCycle(blind bool) {
 	n := s.state.blindCycles
 	s.state.mu.Unlock()
 
-	if n == blindCycleWarnAfter {
+	// Repeat roughly hourly rather than once, ever. A mis-scoped token does not
+	// heal on its own, and a single line that scrolled away days ago is not an
+	// alarm anybody will see.
+	const repeatEvery = 12 // ticks; one reapInterval each
+	if n == blindCycleWarnAfter || (n > blindCycleWarnAfter && (n-blindCycleWarnAfter)%repeatEvery == 0) {
 		log.Printf("[WARN] reconcile: %d consecutive cycles in which GitHub recognised NONE of the tracked "+
 			"jobs. Reconcile is running but retiring nothing, so leaks still clear on the %s horizon only. "+
 			"The usual cause is a GITHUB_TOKEN without actions:read on the repositories these jobs run in",
@@ -212,15 +218,9 @@ func (s *Server) noteBlindCycle(blind bool) {
 //
 // Three properties carry the safety argument:
 //
-//  1. ONLY an authoritative "completed" is authority to forget an id. Every
-//     other outcome — a transport failure, a 5xx, a rate limit, and in
-//     particular a 404 — keeps the entry, because GitHub answers 404 both for an
-//     id it has never heard of and for a private repository the token cannot
-//     read. A token scoped to one repo would otherwise delete every live job
-//     belonging to every other repo in the org and shrink the fleet under them.
-//     The leak this exists to fix is a lost terminal webhook, and in that case
-//     the job really did finish, so GitHub answers 200 + completed. Anything
-//     else keeps reapStaleJobs as its backstop, exactly as today.
+//  1. ONLY an authoritative "completed" is authority to forget an id; see
+//     jobLiveness for why a 404 in particular is not. Everything else keeps the
+//     entry, with reapStaleJobs as its backstop exactly as today.
 //
 //  2. The GitHub round-trips happen with NO locks held, for the same reason
 //     seedFloorOnce reads Railway that way: a webhook must never queue behind a
@@ -229,9 +229,8 @@ func (s *Server) noteBlindCycle(blind bool) {
 //     can never assert a replica for.
 //
 //  3. Because of (2) the snapshot can be stale by the time it is committed, so
-//     the commit is a compare-and-delete on the entry's `since`: an id a webhook
-//     re-registered during the lookup window is left alone rather than deleted
-//     out from under the scale decision that just accounted for it.
+//     the commit is a compare-and-delete on the entry's identity — see
+//     jobEntry.seq, and NOT its timestamp — in the set it was snapshotted from.
 //
 // It deliberately does NOT re-bucket an id when GitHub disagrees about
 // queued-vs-inProgress. apply() scales on the SUM of the two sets, so moving an
@@ -308,6 +307,10 @@ func (s *Server) reconcile(ctx context.Context) {
 	// every 5 minutes and bury the census that actually summarises the cycle.
 	var notFoundIDs, failedIDs []int64
 	var lastErr error
+	// answered records the repositories GitHub actually resolved a job in this
+	// cycle. It is the evidence markInProgress needs before it will adopt an
+	// untracked job in that repository — see State.healthyRepos.
+	answered := map[string]bool{}
 	rateLimited := false
 	for _, c := range cands {
 		if err := ctx.Err(); err != nil {
@@ -336,8 +339,10 @@ func (s *Server) reconcile(ctx context.Context) {
 			lastErr = err
 		case live == jobFinished:
 			finished = append(finished, c)
+			answered[c.entry.repo] = true
 		default:
 			active++
+			answered[c.entry.repo] = true
 		}
 		if rateLimited {
 			break
@@ -367,6 +372,14 @@ func (s *Server) reconcile(ctx context.Context) {
 		s.noteBlindCycle(checked > 0 && len(notFoundIDs) == checked)
 	}
 
+	if len(answered) > 0 {
+		s.state.mu.Lock()
+		for repo := range answered {
+			s.state.healthyRepos[repo] = true
+		}
+		s.state.mu.Unlock()
+	}
+
 	if len(finished) == 0 {
 		return
 	}
@@ -392,6 +405,9 @@ func (s *Server) reconcile(ctx context.Context) {
 	}
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
+	bootHeld := s.clock().Before(s.state.bootFloorUntil) && s.state.bootFloor > 1
+	bootFloor := s.state.bootFloor
+	bootFloorUntil := s.state.bootFloorUntil
 	s.state.mu.Unlock()
 
 	if len(pruned) == 0 {
@@ -403,6 +419,18 @@ func (s *Server) reconcile(ctx context.Context) {
 	// running job. The contraction therefore still lands in this same cycle.
 	log.Printf("reconcile: retired %d job(s) GitHub reports complete, %s ahead of the TTL horizon: %v "+
 		"(queued=%d inProgress=%d)", len(pruned), s.cfg.StaleJobTTL, pruned, queued, inProgress)
+	if queued+inProgress == 0 && bootHeld {
+		// Retiring the entries is not the same as shrinking the fleet. While the
+		// boot-era floor stands, assertDesired deliberately withholds the
+		// contraction, because jobs that were already running when this process
+		// started are invisible to reconcile too — it can only ask about ids it
+		// tracks. An operator watching for the replica count to fall deserves to
+		// know it is being held on purpose rather than stuck.
+		log.Printf("reconcile: the counters are now clear, but the replica count is still held by the "+
+			"boot-era floor of %d until %s — reconcile cannot see jobs that were already running when "+
+			"this process started, so the contraction waits for that horizon",
+			bootFloor, bootFloorUntil.Format(time.RFC3339))
+	}
 }
 
 // probe checks at boot that GITHUB_TOKEN authenticates at all. /rate_limit needs

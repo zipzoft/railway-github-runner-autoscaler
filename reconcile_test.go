@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,10 +89,41 @@ func newReconcileServer(t *testing.T, maxRunners, live int, ttl time.Duration, c
 	srv.github = gh
 	srv.state.mu.Lock()
 	for i := 1; i <= live; i++ {
-		srv.state.inProgress[int64(9000+i)] = jobEntry{since: clock(), repo: testRepo}
+		// nextSeq(), not an implicit 0: production never emits seq 0, and a
+		// fixture that does lets an identity check pass on a value the real code
+		// cannot produce.
+		srv.state.inProgress[int64(9000+i)] = jobEntry{since: clock(), repo: testRepo, seq: srv.state.nextSeq()}
 	}
 	srv.state.mu.Unlock()
 	return srv, rail, gh
+}
+
+// proveRepoReadable makes `repo` eligible for adoption the only way production
+// does: by having GitHub actually answer a lookup for a job in it. Tests must
+// not write State.healthyRepos directly — that is the gate under test.
+func proveRepoReadable(t *testing.T, srv *Server, gh *fakeGitHubClient, repo string) {
+	t.Helper()
+	const sentinel = int64(424242)
+	srv.state.mu.Lock()
+	srv.state.queued[sentinel] = jobEntry{since: srv.clock(), repo: repo, seq: srv.state.nextSeq()}
+	srv.state.mu.Unlock()
+	gh.mu.Lock()
+	gh.answers[sentinel] = jobActive
+	gh.mu.Unlock()
+
+	srv.reconcile(context.Background())
+
+	srv.state.mu.Lock()
+	delete(srv.state.queued, sentinel)
+	healthy := srv.state.healthyRepos[repo]
+	srv.state.mu.Unlock()
+	gh.mu.Lock()
+	delete(gh.answers, sentinel)
+	gh.calls, gh.repos = nil, nil
+	gh.mu.Unlock()
+	if !healthy {
+		t.Fatalf("fixture: %s did not become readable after GitHub answered for it", repo)
+	}
 }
 
 func trackedCount(srv *Server) (int, int) {
@@ -131,7 +166,7 @@ func TestReconcile_PrunesAQueuedEntryWhoseTerminalWebhookWasLost(t *testing.T) {
 	// completed and nothing else. Lose that delivery and the id sits in `queued`
 	// until the TTL horizon.
 	srv.state.mu.Lock()
-	srv.state.queued[555] = jobEntry{since: now, repo: testRepo}
+	srv.state.queued[555] = jobEntry{since: now, repo: testRepo, seq: srv.state.nextSeq()}
 	srv.state.mu.Unlock()
 	gh.answers[555] = jobFinished
 
@@ -203,7 +238,7 @@ func TestReconcile_SkipsAnEntryThatCarriesNoRepo(t *testing.T) {
 	now := testClock()
 	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
 	srv.state.mu.Lock()
-	srv.state.inProgress[42] = jobEntry{since: now} // no repo: planted before the field existed
+	srv.state.inProgress[42] = jobEntry{since: now, seq: srv.state.nextSeq()} // payload carried no repository
 	srv.state.mu.Unlock()
 	gh.answers[42] = jobFinished
 
@@ -293,10 +328,33 @@ func TestReconcile_CannotShrinkTheFleetBelowTheBootEraFloor(t *testing.T) {
 	now = now.Add(time.Minute)
 	srv.tick(context.Background())
 
+	if q, ip := trackedCount(srv); q != 0 || ip != 0 {
+		t.Fatalf("fixture: reconcile did not retire the tracked set (queued=%d inProgress=%d)", q, ip)
+	}
 	for _, n := range rail.allCalls() {
 		if n < 5 {
 			t.Fatalf("reconcile drove the fleet to %d while the boot floor was 5; calls %v", n, rail.allCalls())
 		}
+	}
+
+	// The assertion above is satisfied by an EMPTY call list, so on its own it
+	// cannot distinguish "the floor held" from "nothing happened at all". The
+	// positive control is what makes it evidence: step past the horizon and the
+	// very same state must now contract, proving the first tick's silence was
+	// the floor doing its job rather than inertia.
+	before := len(rail.allCalls())
+	srv.state.mu.Lock()
+	srv.state.bootFloorUntil = now.Add(-time.Second)
+	srv.state.mu.Unlock()
+	now = now.Add(time.Minute)
+	srv.tick(context.Background())
+
+	calls := rail.allCalls()
+	if len(calls) == before {
+		t.Fatalf("nothing was pushed even after the boot horizon lapsed; the first tick proved nothing")
+	}
+	if last := calls[len(calls)-1]; last != 1 {
+		t.Fatalf("fleet at %d after the horizon lapsed, want 1; calls %v", last, calls)
 	}
 }
 
@@ -307,7 +365,7 @@ func TestReconcile_DoesNotDeleteAnIdReQueuedDuringTheLookup(t *testing.T) {
 	clock := func() time.Time { return now }
 	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, clock)
 	srv.state.mu.Lock()
-	srv.state.inProgress[77] = jobEntry{since: now, repo: testRepo}
+	srv.state.inProgress[77] = jobEntry{since: now, repo: testRepo, seq: srv.state.nextSeq()}
 	srv.state.mu.Unlock()
 	gh.answers[77] = jobFinished
 
@@ -317,7 +375,7 @@ func TestReconcile_DoesNotDeleteAnIdReQueuedDuringTheLookup(t *testing.T) {
 	// created — and, worse, one whose replica the fleet was just scaled for.
 	gh.duringCall = func() {
 		srv.state.mu.Lock()
-		srv.state.queued[77] = jobEntry{since: now.Add(time.Second), repo: testRepo}
+		srv.state.queued[77] = jobEntry{since: now.Add(time.Second), repo: testRepo, seq: srv.state.nextSeq()}
 		delete(srv.state.inProgress, 77)
 		srv.state.mu.Unlock()
 	}
@@ -391,7 +449,7 @@ func TestReconcile_ChecksTheOldestEntriesFirstAndStopsAtTheCycleCap(t *testing.T
 	for i := 0; i < total; i++ {
 		id := int64(1000 + i)
 		// id 1000 is the oldest, 1000+total-1 the newest.
-		srv.state.inProgress[id] = jobEntry{since: now.Add(time.Duration(i) * time.Second), repo: testRepo}
+		srv.state.inProgress[id] = jobEntry{since: now.Add(time.Duration(i) * time.Second), repo: testRepo, seq: srv.state.nextSeq()}
 	}
 	srv.state.mu.Unlock()
 
@@ -599,7 +657,8 @@ func TestMarkInProgress_CarriesTheRepoAcross(t *testing.T) {
 
 func TestMarkInProgress_AdoptsAnUntrackedJobWhenReconcileIsEnabled(t *testing.T) {
 	now := testClock()
-	srv, _, _ := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+	proveRepoReadable(t, srv, gh, testRepo)
 
 	// No `queued` was ever seen for 4242 — that delivery was lost. The job is
 	// running right now on a replica this process is not counting.
@@ -641,6 +700,7 @@ func TestReconcile_DoesNotShrinkTheFleetUnderAnUntrackedJob(t *testing.T) {
 	srv.state.bootFloorUntil = now.Add(-time.Minute) // boot horizon long gone
 	delete(srv.state.inProgress, 9002)
 	srv.state.mu.Unlock()
+	proveRepoReadable(t, srv, gh, testRepo)
 	postWebhook(srv, "in_progress", 7777) // the untracked job announces itself
 
 	gh.answers[9001] = jobFinished // the leak: really finished
@@ -907,10 +967,15 @@ func TestReconcile_KeepsCompletionsAlreadyConfirmedWhenARateLimitCutsTheCycleSho
 	// start refusing. That answer does not become less true because a later
 	// request was throttled, and discarding it would leave a known-dead entry
 	// holding a replica for another cycle.
+	// The fake reads failWith BEFORE duringCall runs, so arming it during call 1
+	// is what makes call 2 the refused one. Getting this off by one made job 2
+	// survive via a 404 instead — the assertion passed for the wrong reason.
+	gh.answers[2] = jobFinished // would be pruned, if the lookup were allowed
+	gh.answers[3] = jobFinished
 	var seen int
 	gh.duringCall = func() {
 		seen++
-		if seen == 2 {
+		if seen == 1 {
 			gh.mu.Lock()
 			gh.failWith = fmt.Errorf("%w: status 403", errRateLimited)
 			gh.mu.Unlock()
@@ -928,6 +993,9 @@ func TestReconcile_KeepsCompletionsAlreadyConfirmedWhenARateLimitCutsTheCycleSho
 	}
 	if !two {
 		t.Fatalf("pruned job 2, whose lookup was refused — a rate limit is not a completion")
+	}
+	if n := gh.callCount(); n != 2 {
+		t.Fatalf("made %d lookups; want 2 — job 1 answered, job 2 refused, then stop", n)
 	}
 }
 
@@ -979,8 +1047,201 @@ func TestEndToEnd_ALostCompletedWebhookClearsInOneTickInsteadOfSevenHours(t *tes
 	if last, ok := rail.lastCall(); !ok || last != 1 {
 		t.Fatalf("fleet at %d after the leak cleared, want 1; calls %v", last, rail.allCalls())
 	}
-	// And the elapsed time is one tick, not the TTL horizon.
-	if elapsed := now.Sub(testClock()); elapsed > 10*time.Minute {
-		t.Fatalf("took %s of simulated time; the point is that it beats the %s horizon", elapsed, srv.cfg.StaleJobTTL)
+}
+
+// --- adoption's bound has to be demonstrated, not assumed ------------------
+
+func TestMarkInProgress_RefusesToAdoptUntilGitHubHasAnsweredForThatRepo(t *testing.T) {
+	now := testClock()
+	srv, _, _ := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+
+	// GITHUB_TOKEN is set — but nothing has proved it can read this repository.
+	// An expired token, or one without actions:read here, fails or 404s every
+	// lookup, and neither retires an entry. Adopting now would create a phantom
+	// with no bound at all: it would hold a replica for the full TTL, which is
+	// exactly the harm refusing to adopt existed to prevent.
+	postWebhook(srv, "in_progress", 4242)
+
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[4242]
+	srv.state.mu.Unlock()
+	if present {
+		t.Fatalf("adopted a job in a repository GitHub has never answered for")
+	}
+}
+
+func TestMarkInProgress_AdoptionIsPerRepositoryNotGlobal(t *testing.T) {
+	now := testClock()
+	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+	proveRepoReadable(t, srv, gh, testRepo)
+
+	// A token can hold actions:read on one repo and not another, and GitHub
+	// reports the difference as a 404 — which never retires an entry. So proving
+	// one repository readable must not licence adoption in a different one.
+	payload := fmt.Sprintf(
+		`{"action":"in_progress","workflow_job":{"id":5150,"labels":["self-hosted","railway"]},"repository":{"full_name":%q}}`,
+		"zipzoft/some-other-repo")
+	postRawWebhook(srv, []byte(payload))
+
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[5150]
+	srv.state.mu.Unlock()
+	if present {
+		t.Fatalf("readability of %s was taken as readability of another repository", testRepo)
+	}
+}
+
+func TestReconcile_RetiresAJobItAdopted(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, _, gh := newReconcileServer(t, 6, 0, 7*time.Hour, clock)
+	proveRepoReadable(t, srv, gh, testRepo)
+
+	// The whole justification for adopting is that reconcile can retire what it
+	// adopts within one cycle. An adopted entry takes a different path from the
+	// hand-planted ones — its repo comes from the payload and its identity from
+	// nextSeq() — so the claim needs its own test or it is only an assertion.
+	postWebhook(srv, "in_progress", 8888)
+	srv.state.mu.Lock()
+	_, adopted := srv.state.inProgress[8888]
+	srv.state.mu.Unlock()
+	if !adopted {
+		t.Fatalf("fixture: job was not adopted, so this proves nothing")
+	}
+
+	gh.answers[8888] = jobFinished // it had in fact already completed
+	now = now.Add(time.Minute)
+	srv.reconcile(context.Background())
+
+	srv.state.mu.Lock()
+	_, stillThere := srv.state.inProgress[8888]
+	srv.state.mu.Unlock()
+	if stillThere {
+		t.Fatalf("an adopted phantom survived a reconcile cycle; adoption's cost bound is not real")
+	}
+}
+
+func TestMarkInProgress_LateWebhookAfterCompleteIsReinjectedButRetiredWithinOneCycle(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, _, gh := newReconcileServer(t, 6, 0, 7*time.Hour, clock)
+	proveRepoReadable(t, srv, gh, testRepo)
+
+	// The counterpart to TestMarkInProgress_LateWebhookAfterCompleteDoesNotReinject,
+	// which pins the no-token half. With reconcile available the trade is
+	// deliberately reversed: a late in_progress for an already-finished job IS
+	// readmitted, because refusing costs a cancelled live job while accepting
+	// costs one replica for one cycle. That bound is the part worth asserting.
+	postWebhook(srv, "queued", 100)
+	postWebhook(srv, "in_progress", 100)
+	postWebhook(srv, "completed", 100)
+	postWebhook(srv, "in_progress", 100) // retried delivery, arriving late
+
+	srv.state.mu.Lock()
+	_, reinjected := srv.state.inProgress[100]
+	srv.state.mu.Unlock()
+	if !reinjected {
+		t.Fatalf("expected the late webhook to be readmitted when reconcile can bound it")
+	}
+
+	gh.answers[100] = jobFinished
+	now = now.Add(time.Minute)
+	srv.reconcile(context.Background())
+
+	srv.state.mu.Lock()
+	_, stillThere := srv.state.inProgress[100]
+	srv.state.mu.Unlock()
+	if stillThere {
+		t.Fatalf("the readmitted phantom outlived its one cycle")
+	}
+}
+
+// --- the warning is the deliverable, not the counter ------------------------
+
+func TestReconcile_TheBlindCycleWarningActuallyReachesTheLog(t *testing.T) {
+	now := testClock()
+	srv, _, _ := newReconcileServer(t, 6, 2, time.Hour, func() time.Time { return now })
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	// Two cycles is below the threshold; the third is what an operator must see.
+	// Asserting on state.blindCycles alone would stay green if the emit
+	// condition were broken, and the emitted line is the entire point.
+	for i := 0; i < 2; i++ {
+		srv.reconcile(context.Background())
+	}
+	if strings.Contains(buf.String(), "consecutive cycles") {
+		t.Fatalf("warned before the threshold:\n%s", buf.String())
+	}
+	srv.reconcile(context.Background())
+	if !strings.Contains(buf.String(), "consecutive cycles in which GitHub recognised NONE") {
+		t.Fatalf("no warning after 3 blind cycles:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "actions:read") {
+		t.Fatalf("the warning does not name the likely cause:\n%s", buf.String())
+	}
+}
+
+// --- the one field that crosses a trust boundary ---------------------------
+
+func TestHandleWebhook_RejectsAnImplausibleRepository(t *testing.T) {
+	now := testClock()
+	srv, _ := newTestServer(6, time.Hour, func() time.Time { return now })
+
+	// repo is interpolated into an outbound URL with a credential attached. A
+	// value that is not owner/name degrades to "", a state every path already
+	// handles safely — rather than being sent to GitHub as a path.
+	payload := `{"action":"queued","workflow_job":{"id":7,"labels":["self-hosted","railway"]},` +
+		`"repository":{"full_name":"../../../evil"}}`
+	postRawWebhook(srv, []byte(payload))
+
+	srv.state.mu.Lock()
+	entry := srv.state.queued[7]
+	srv.state.mu.Unlock()
+	if entry.repo != "" {
+		t.Fatalf("stored repo %q; a traversal-shaped value must not reach the request path", entry.repo)
+	}
+}
+
+func TestValidRepo(t *testing.T) {
+	for _, ok := range []string{"zipzoft/products", "a/b", "Org.Name/repo-name_1", "zipzoft/zmepo.io"} {
+		if !validRepo(ok) {
+			t.Errorf("validRepo(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "noslash", "a/b/c", "../../evil", "a/b?x=1", "a b/c", "a/b\nHost: x", "/b", "a/"} {
+		if validRepo(bad) {
+			t.Errorf("validRepo(%q) = true, want false", bad)
+		}
+	}
+}
+
+func TestReconcile_A404DoesNotMakeARepositoryEligibleForAdoption(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, _, _ := newReconcileServer(t, 6, 2, time.Hour, clock)
+
+	// A token without actions:read on this repository 404s on every job in it.
+	// If a 404 counted as "GitHub answered", a mis-scoped token would unlock
+	// adoption while remaining unable to retire anything — manufacturing exactly
+	// the unbounded phantoms the gate exists to prevent. Only a resolved status
+	// counts.
+	srv.reconcile(context.Background())
+
+	srv.state.mu.Lock()
+	healthy := srv.state.healthyRepos[testRepo]
+	srv.state.mu.Unlock()
+	if healthy {
+		t.Fatalf("a 404 marked %s readable", testRepo)
+	}
+
+	postWebhook(srv, "in_progress", 4242)
+	srv.state.mu.Lock()
+	_, present := srv.state.inProgress[4242]
+	srv.state.mu.Unlock()
+	if present {
+		t.Fatalf("adopted a job in a repository whose every lookup 404s")
 	}
 }

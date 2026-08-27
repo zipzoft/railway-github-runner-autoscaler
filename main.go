@@ -41,14 +41,16 @@ const (
 	// reconcileBudget is the WALL-CLOCK ceiling on one reconcile pass, and it is
 	// not the same bound as reconcileMaxPerCycle. That one caps requests against
 	// GitHub's hourly budget; this one caps how long the background tick can be
-	// held up. They protect different things and dropping either reintroduces a
-	// failure: without this bound, a degraded GitHub (50 ids x a 10s timeout =
-	// 500s) outlasts the 300s reapInterval, the ticker's single-slot channel
-	// drops ticks, and assertDesired runs at half cadence or worse — precisely
-	// when it is needed most, since the same provider that is failing to answer
-	// lookups is the one failing to deliver webhooks. assertDesired is what makes
-	// the no-deadlock guarantee unconditional (ATT-482); nothing new may make it
-	// conditional on GitHub's latency.
+	// held up. They protect different things.
+	//
+	// Without it, a degraded GitHub costs up to reconcileMaxPerCycle x
+	// githubRequestTimeout = 50 x 5s = 250s of a 300s reapInterval, leaving 50
+	// seconds for reapStaleJobs and assertDesired and no margin at all if either
+	// bound is later raised. 60s keeps reconcile a small fraction of its own
+	// tick. assertDesired is what makes the no-deadlock guarantee unconditional
+	// (ATT-482), and nothing new may make it conditional on GitHub's latency —
+	// least of all when the provider failing to answer lookups is the same one
+	// failing to deliver the webhooks assertDesired exists to compensate for.
 	reconcileBudget = 60 * time.Second
 	// reconcileMaxPerCycle bounds the GitHub lookups one reconcile pass may
 	// issue. The tracked set is normally at most a handful of ids, so this is a
@@ -120,6 +122,17 @@ type State struct {
 	// in, which makes reconcile a silent no-op — the exact 7h leak it exists to
 	// remove, with nothing else to show for it.
 	blindCycles int
+	// healthyRepos holds the repositories GitHub has actually answered a lookup
+	// for. It gates adoption, and it has to be per-repository rather than a
+	// single "reconcile works" flag: a token can hold actions:read on one repo
+	// and not another, and GitHub reports the difference as a 404 — the one
+	// answer that must never retire an entry. Adopting a job in a repo we cannot
+	// read would create a phantom nothing can ever retire, holding a replica for
+	// the full StaleJobTTL. That is precisely the harm refusing to adopt used to
+	// prevent, so adoption waits until this process has seen GitHub answer for
+	// that repository at least once. Empty at boot, so the default is the old,
+	// safe behaviour.
+	healthyRepos map[string]bool
 	// seq hands out a fresh identity to every entry inserted into either set.
 	// See jobEntry.seq for why reconcile cannot use the timestamp for this.
 	seq uint64
@@ -230,6 +243,7 @@ func newState(applied int, now time.Time, ttl time.Duration) *State {
 	return &State{
 		queued:         make(map[int64]jobEntry),
 		inProgress:     make(map[int64]jobEntry),
+		healthyRepos:   make(map[string]bool),
 		applied:        applied,
 		bootFloor:      applied,
 		bootFloorUntil: now.Add(ttl),

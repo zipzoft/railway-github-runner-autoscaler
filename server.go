@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -95,7 +96,18 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	log.Printf("webhook received: action=%s labels=%v", event.Action, event.WorkflowJob.Labels)
 
 	id := event.WorkflowJob.ID
+	// repo is the only webhook field this service interpolates into an outbound
+	// URL (github.go's job endpoint) and into log lines. It is HMAC-gated, so
+	// this is hardening rather than a hole, but it is the one value crossing a
+	// trust boundary and it is never otherwise checked. A non-conforming value
+	// degrades to "" — a state every path already handles safely: reconcile
+	// skips the entry and adoption refuses it.
 	repo := event.Repository.FullName
+	if repo != "" && !validRepo(repo) {
+		log.Printf("[WARN] webhook: repository %q is not a plausible owner/name; job %d will be tracked "+
+			"without one and can only clear on the %s horizon", repo, id, s.cfg.StaleJobTTL)
+		repo = ""
+	}
 	// Scaling side-effects run on a background context with their own deadline,
 	// so a GitHub delivery connection that drops after the job state was already
 	// recorded can't cancel the scale mid-flight. Non-scaling actions ignore it.
@@ -141,6 +153,13 @@ func validateHMAC(body []byte, sigHeader, secret string) bool {
 	return hmac.Equal(mac.Sum(nil), provided)
 }
 
+// repoPattern is GitHub's own shape for "owner/name". Deliberately strict: the
+// value ends up in a URL path with a credential attached, and every caller
+// already treats "" as "cannot look this up".
+var repoPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$`)
+
+func validRepo(repo string) bool { return repoPattern.MatchString(repo) }
+
 // hasLabels returns true if every label in required appears in jobLabels (case-insensitive).
 func hasLabels(jobLabels, required []string) bool {
 	lower := make(map[string]struct{}, len(jobLabels))
@@ -174,17 +193,32 @@ func hasLabels(jobLabels, required []string) bool {
 // Reconcile is what makes adoption safe: an adopted phantom is checked against
 // GitHub within one tick and retired if it really had finished. That trades an
 // UNRECOVERABLE error (cancelling a running job) for a RECOVERABLE one (one
-// spare replica for at most one cycle). With no GitHub client the old trade is
-// still the right one and the old behaviour stands unchanged.
+// spare replica for at most one cycle).
+//
+// The bound only holds where reconcile can actually answer, so adoption waits
+// for proof rather than for configuration. A GITHUB_TOKEN merely being SET
+// proves nothing: an expired one fails every lookup, and one without
+// actions:read on this job's repository 404s on it forever — and a 404 must
+// never retire an entry, so the phantom would hold a replica for the full TTL.
+// That is the harm refusing to adopt existed to prevent. So the gate is
+// State.healthyRepos: this process must have seen GitHub answer a lookup for
+// THIS repository before it will adopt a job in it. Until then, and whenever no
+// client is configured at all, the old refusal stands unchanged.
 func (s *Server) markInProgress(id int64, repo string) {
 	s.state.mu.Lock()
 	if _, queued := s.state.queued[id]; !queued {
-		if s.github == nil || repo == "" {
-			// No way to bound a phantom's lifetime, so keep refusing: a late or
-			// retried in_progress for an already-completed job would otherwise
-			// hold the fleet above its idle baseline until the TTL reaper.
+		if s.github == nil || repo == "" || !s.state.healthyRepos[repo] {
+			// Nothing here can bound a phantom's lifetime, so keep refusing: a
+			// late or retried in_progress for an already-completed job would
+			// otherwise hold the fleet above its idle baseline until the TTL
+			// reaper.
+			why := "late or out-of-order webhook"
+			if s.github != nil && repo != "" {
+				why = "GitHub has not yet answered a lookup for " + repo +
+					", so an adopted phantom could not be retired"
+			}
 			s.state.mu.Unlock()
-			log.Printf("in_progress ignored: job %d is not queued (late or out-of-order webhook)", id)
+			log.Printf("in_progress ignored: job %d is not queued (%s)", id, why)
 			return
 		}
 		s.state.inProgress[id] = jobEntry{since: s.clock(), repo: repo, seq: s.state.nextSeq()}
