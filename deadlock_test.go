@@ -27,10 +27,11 @@ import (
 // seedFloor is re-run because that read is exactly how boot sets the floor.
 func newTestServerWithLiveFleet(maxRunners, live int, ttl time.Duration, clock func() time.Time) (*Server, *fakeRailwayClient) {
 	srv, client := newTestServer(maxRunners, ttl, clock)
+	// Re-run boot against a fleet of `live`, the same two steps in the same
+	// order that main performs: cap-width state, then the seed.
 	client.replicas = live
-	srv.state.mu.Lock()
-	srv.state.applied = seedFloor(context.Background(), client, maxRunners)
-	srv.state.mu.Unlock()
+	srv.state = newState(maxRunners, clock(), ttl)
+	srv.seedFloorOnce(context.Background())
 	return srv, client
 }
 
@@ -153,51 +154,58 @@ func TestScaleUp_ColdStartAssertsWithoutShrinkingAPossiblyLiveFleet(t *testing.T
 }
 
 // The floor must release itself, or a restart would pin the fleet at its boot
-// width forever and bill idle runners. A drain this process actually WATCHED —
-// work tracked, then gone — is the one moment shrinking is known to be safe.
-//
-// The fixture boots against a live fleet of 6 so there is a floor worth
-// releasing: with the default fixture the floor is already 1 and this test
-// cannot fail.
-func TestApply_FloorReleasesOnAnObservedDrain(t *testing.T) {
-	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
+// width forever and bill idle runners. What releases it is the boot horizon
+// passing — NOT a drain, however clean.
+func TestApply_BootFloorReleasesWhenTheHorizonPasses(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	ttl := time.Hour
+	srv, client := newTestServerWithLiveFleet(6, 6, ttl, clock)
 	ctx := context.Background()
 
 	if err := srv.scaleUp(ctx, 1); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
 	srv.markInProgress(1)
-	if last, _ := client.lastCall(); last != 6 {
-		t.Fatalf("expected the floor held at 6 while the job runs, got %d", last)
-	}
-
 	if err := srv.scaleDown(ctx, 1); err != nil {
 		t.Fatalf("scaleDown: %v", err)
 	}
+	if last, _ := client.lastCall(); last != 6 {
+		t.Fatalf("the floor must still hold at 6 inside the boot horizon, got %d", last)
+	}
+
+	// Past the horizon, no boot-era job can still be alive.
+	now = now.Add(ttl + time.Minute)
+	srv.assertDesired(ctx)
 
 	if last, ok := client.lastCall(); !ok || last != 1 {
-		t.Fatalf("expected the fleet released to 1 replica after an observed drain, got %d (ok=%v)", last, ok)
+		t.Fatalf("expected the fleet released to 1 once the boot horizon passed, got %d (ok=%v)", last, ok)
 	}
 }
 
-// The mirror image, and the hole the first rework left open: after a restart the
-// counters are empty too, but that is ignorance, not an observed drain. The
-// first `completed` webhook is routinely for a job this process never tracked —
-// scaleDown deletes an id from neither map, both counts read zero, and treating
-// that as "idle" pushes SetReplicas(1) at a fleet six jobs deep.
-func TestApply_EmptyCountsAfterBootAreNotAnObservedDrain(t *testing.T) {
+// A drain inside the horizon proves nothing, and this is the hole that tracking
+// alone could not close. Boot-era jobs are permanently invisible: markInProgress
+// refuses to adopt an id it never queued, so their completions are never
+// counted. Deciding on "a drain I watched" just defers the harm by one job
+// cycle — a new job arrives, runs, finishes, the counters read zero again, and
+// SetReplicas(1) cancels every boot-era job still going.
+func TestApply_ATrackedJobCycleDoesNotReleaseTheFloorUnderBootEraWork(t *testing.T) {
 	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, testClock)
+	ctx := context.Background()
 
-	// A terminal webhook for a job from before this process existed.
-	if err := srv.scaleDown(context.Background(), 999); err != nil {
+	// One ordinary tracked cycle while 5 boot-era jobs are still running.
+	if err := srv.scaleUp(ctx, 100); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	srv.markInProgress(100)
+	if err := srv.scaleDown(ctx, 100); err != nil {
 		t.Fatalf("scaleDown: %v", err)
 	}
 
 	for _, n := range client.allCalls() {
 		if n < 6 {
-			t.Fatalf("pushed %d at a fleet of 6 whose jobs this process never tracked; an empty "+
-				"count right after boot is ignorance, not evidence the fleet is idle (calls=%v)",
-				n, client.allCalls())
+			t.Fatalf("pushed %d after one tracked job cycle; the boot-era jobs are still running "+
+				"and no webhook sequence can prove otherwise (calls=%v)", n, client.allCalls())
 		}
 	}
 }
@@ -250,7 +258,7 @@ func TestApply_NeverShrinksTheFleetWhileAJobIsStillRunning(t *testing.T) {
 // Recovery must not depend on another webhook arriving. Webhooks fire on job
 // state CHANGES; a queued job that no runner ever picks up has no further state
 // to change. If the fleet dies after the last job was queued, nothing else
-// would call apply and the backlog would sit until the 6h TTL.
+// would call apply and the backlog would sit until the stale-job TTL expired.
 func TestAssertDesired_RepushesWhileWorkIsOutstandingWithNoFurtherWebhooks(t *testing.T) {
 	now := testClock()
 	clock := func() time.Time { return now }
@@ -390,13 +398,17 @@ func TestReapStaleJobs_ClearsPhantomsAndReturnsFleetToBaseline(t *testing.T) {
 func TestAssertDesired_RetriesAContractionThatFailed(t *testing.T) {
 	now := testClock()
 	clock := func() time.Time { return now }
-	srv, client := newTestServerWithLiveFleet(6, 6, time.Hour, clock)
+	ttl := time.Hour
+	srv, client := newTestServerWithLiveFleet(6, 6, ttl, clock)
 	ctx := context.Background()
 
 	if err := srv.scaleUp(ctx, 1); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
 	srv.markInProgress(1)
+
+	// Past the boot horizon, so the end-of-batch contraction is genuinely due.
+	now = now.Add(ttl + time.Minute)
 
 	// The contraction at the end of the batch fails.
 	client.err = fmt.Errorf("railway down")

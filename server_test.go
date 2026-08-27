@@ -102,10 +102,14 @@ func newTestServer(maxRunners int, ttl time.Duration, clock func() time.Time) (*
 			StaleJobTTL:   ttl,
 			RunnerLabels:  []string{"self-hosted", "railway"},
 		},
-		state:  newState(seedFloor(context.Background(), client, maxRunners)),
+		state:  newState(maxRunners, clock(), ttl),
 		client: client,
 		clock:  clock,
 	}
+	// Mirror production boot exactly: state starts at the cap, then the floor is
+	// refined from what the client reports. Constructing State by hand here is
+	// what let the fixture and production disagree about the floor.
+	srv.seedFloorOnce(context.Background())
 	return srv, client
 }
 

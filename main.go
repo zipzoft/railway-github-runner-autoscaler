@@ -35,10 +35,8 @@ const (
 	// does not depend on the suppressed calls: assertDesired re-pushes every
 	// reapInterval for as long as any job is outstanding.
 	coalesceWindow = 30 * time.Second
-	// seedTimeout bounds the boot-time replica read. It no longer gates the
-	// listener, so it can be generous — the only thing waiting on it is a
-	// webhook that arrives in the first moments after boot, whose own scale
-	// context allows 15s.
+	// seedTimeout bounds the boot-time replica read. The read holds no locks, so
+	// nothing waits on it — not the listener, not a webhook.
 	seedTimeout = 10 * time.Second
 )
 
@@ -65,27 +63,31 @@ type Config struct {
 // replacing the finished-job accounting that used to serve that purpose by
 // accident. lastPush is when that value was pushed, and drives coalescing.
 //
-// observedWork distinguishes the two ways the counters can read empty, which
-// look identical but mean opposite things:
+// bootFloor and bootFloorUntil cover the jobs that were already running when
+// this process started. Those jobs are permanently invisible to it: markInProgress
+// refuses to adopt an id that was never queued here, so a restart-era job is
+// never tracked and its completion is never counted. An empty pair of counters
+// therefore does NOT mean the fleet is idle until enough time has passed that no
+// boot-era job could still be running.
 //
-//   - "I watched the queue drain to nothing" — the fleet really is idle and
-//     shrinking to one replica is safe.
-//   - "I just booted" — the counters say nothing about the fleet, which may be
-//     six replicas deep in a batch.
+// Tracking cannot close this. Deciding on "a drain I watched" only defers the
+// harm by one job cycle: a new job arrives, runs, finishes, the counters return
+// to zero, and SetReplicas(1) cancels every boot-era job still going. The only
+// honest bound is time, so bootFloor holds until StaleJobTTL has elapsed since
+// boot — the same horizon beyond which this service already declares a job dead.
 //
-// Without this flag the first `completed` webhook after a restart takes the
-// second case for the first: scaleDown deletes an id it never tracked, both
-// counters are zero, the floor is skipped as though the fleet were idle, and
-// SetReplicas(1) cancels every job still running. It is set the first time this
-// process actually tracks work, so an empty count only counts as idle once
-// there was something to become empty.
+// The cost is real and worth stating: a restart while the fleet is wide holds it
+// wide for that horizon, even if the width was itself a leak. That is bounded
+// over-provisioning, and it is the recoverable direction. Reconciling against
+// GitHub's own view of in-progress jobs is what removes the horizon entirely.
 type State struct {
-	mu           sync.Mutex
-	queued       map[int64]time.Time
-	inProgress   map[int64]time.Time
-	applied      int
-	lastPush     time.Time
-	observedWork bool
+	mu             sync.Mutex
+	queued         map[int64]time.Time
+	inProgress     map[int64]time.Time
+	applied        int
+	lastPush       time.Time
+	bootFloor      int
+	bootFloorUntil time.Time
 }
 
 // RailwayClient scales the runner service. It is an interface so tests can
@@ -172,15 +174,20 @@ func loadConfig() (Config, error) {
 	}, nil
 }
 
-// newState builds the boot state with the replica floor seeded to `applied`. It
-// exists so the floor cannot be seeded one way in production and another in a
-// test: getting that seed wrong is the difference between reviving a dead fleet
-// and cancelling live CI jobs.
-func newState(applied int) *State {
+// newState builds the boot state. It exists so the floor cannot be seeded one
+// way in production and another in a test: getting that seed wrong is the
+// difference between reviving a dead fleet and cancelling live CI jobs.
+//
+// The floor starts at the cap and the boot horizon starts running immediately,
+// so the fleet is protected from the very first webhook — before seedFloorOnce
+// has had a chance to refine the value downward against reality.
+func newState(applied int, now time.Time, ttl time.Duration) *State {
 	return &State{
-		queued:     make(map[int64]time.Time),
-		inProgress: make(map[int64]time.Time),
-		applied:    applied,
+		queued:         make(map[int64]time.Time),
+		inProgress:     make(map[int64]time.Time),
+		applied:        applied,
+		bootFloor:      applied,
+		bootFloorUntil: now.Add(ttl),
 	}
 }
 
@@ -232,7 +239,7 @@ func main() {
 		// Start the floor at the cap. seedFloorOnce refines it from Railway's
 		// live count moments later; until then the cap is the value that cannot
 		// shrink a fleet which may be mid-job.
-		state:  newState(cfg.MaxRunners),
+		state:  newState(cfg.MaxRunners, time.Now(), cfg.StaleJobTTL),
 		client: newRailwayClient(cfg),
 		clock:  time.Now,
 	}

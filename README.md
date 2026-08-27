@@ -51,7 +51,11 @@ desired = clamp(queued + inProgress, 1, MAX_RUNNERS)
 Two rules keep this safe, and both exist because of a real outage (see fork note 3):
 
 - **The count is asserted, never assumed.** Every scale decision pushes a value, including when the backlog is over the cap and when the value is unchanged. That push is the only thing that can revive a fleet whose replicas died unobserved. Repeat pushes of an unchanged value are coalesced within a 30s window, and the background tick re-asserts every 5 minutes for as long as any job is outstanding — so recovery never depends on another webhook arriving.
-- **The count never shrinks while work is outstanding.** Railway may drop any replica when `numReplicas` decreases, including one mid-job. The floor starts at whatever Railway reports at boot — *not* at zero, because a restart cannot tell an idle replica from a busy one — and only relaxes once this process has watched the queue drain to nothing.
+- **The count never shrinks while *tracked* work is outstanding.** Railway may drop any replica when `numReplicas` decreases, including one mid-job, so while this process has jobs outstanding the count only holds or rises.
+
+  Note the word *tracked*, because it is the whole caveat. **Jobs already running when the process starts are invisible to it forever** — `markInProgress` refuses to adopt an id it never queued, so a restart-era job is never counted and its completion never observed. Empty counters after a restart mean "I know nothing", not "the fleet is idle", and no sequence of webhooks can tell those apart: deciding on a drain the process *did* watch only defers the harm by one job cycle. So a second floor, seeded from Railway's live count at boot, holds for `STALE_JOB_TTL_MINUTES` — the same horizon past which this service already declares a job dead — and time, not tracking, is what releases it.
+
+  The cost is real: a restart while the fleet is wide holds it wide for that horizon, even when the width was itself a leak. That is bounded over-provisioning, and it is the recoverable direction. Reconciling against GitHub's own view of in-progress jobs is what would remove the horizon.
 
 > **Note:** This approach is best suited for projects with infrequent or bursty CI workloads. One replica stays running at all times (consuming minimal memory while idle), scaling up for concurrent jobs and resetting back to 1 when all jobs are done. If your runners are consistently running many concurrent jobs, consider adjusting `MAX_RUNNERS` accordingly.
 
@@ -72,7 +76,7 @@ The template creates two services:
 | `RAILWAY_API_TOKEN` | Generate at [railway.app/account/tokens](https://railway.app/account/tokens) (this fork sends it as `Project-Access-Token` — use a **project** token) |
 | `RAILWAY_RUNNER_SERVICE_ID` | Auto-filled in template from the **github-runner** service |
 | `MAX_RUNNERS` | Optional, default `3` |
-| `STALE_JOB_TTL_MINUTES` | Optional, default `360` (6h) — safety-net TTL for jobs whose terminal webhook was never received |
+| `STALE_JOB_TTL_MINUTES` | Optional, default `420` (7h) — safety-net TTL for jobs whose terminal webhook was never received. Also the horizon for the boot-era replica floor. Keep it above your longest `timeout-minutes`; GitHub's own default is 360 |
 
 **github-runner** (`myoung34/github-runner:latest`)
 | Variable | Description |
@@ -117,7 +121,7 @@ patches on top of upstream:
    without ever firing `in_progress`. `scaleDown` now retires the job id from
    *both* `queued` and `inProgress` on every `completed` event, so the queued
    count always returns to zero when nothing is running. A periodic
-   `reapStaleJobs` sweep (`STALE_JOB_TTL_MINUTES`, default 360 = 6h) is a
+   `reapStaleJobs` sweep (`STALE_JOB_TTL_MINUTES`, default 420 = 7h) is a
    defense-in-depth safety net for the separate, much rarer case of a
    completely lost webhook delivery. See `server_test.go` for the regression
    coverage, in particular `TestScaleDown_RepeatedCancelWhileQueued_NeverLeaksAcrossManyBatches`.
@@ -128,8 +132,9 @@ patches on top of upstream:
    **without calling `setReplicas` at all**. No runner started, so no job
    completed, so no webhook arrived to unwind the count. The finished-job set is
    gone, the count is asserted on every decision (coalesced, plus a periodic
-   re-assert), and a replica floor seeded from Railway's live count stops a
-   restart from shrinking a fleet that is mid-job. See `deadlock_test.go`.
+   re-assert), and two replica floors — one for tracked work, one covering the
+   boot-era jobs this process can never see — stop a scale decision from
+   shrinking a fleet that is mid-job. See `deadlock_test.go` and `seed_test.go`.
 
 **Image:** published to GHCR by `.github/workflows/docker-publish.yml` on every
 push to `main` and on `v*` tags — `ghcr.io/zipzoft/railway-github-runner-autoscaler`.
