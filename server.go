@@ -153,12 +153,27 @@ func validateHMAC(body []byte, sigHeader, secret string) bool {
 	return hmac.Equal(mac.Sum(nil), provided)
 }
 
-// repoPattern is GitHub's own shape for "owner/name". Deliberately strict: the
-// value ends up in a URL path with a credential attached, and every caller
-// already treats "" as "cannot look this up".
-var repoPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$`)
+// repoPattern is GitHub's shape for "owner/name". The owner half is the
+// stricter of the two — GitHub logins are alphanumerics and single hyphens, with
+// no dots or underscores — and the repository half allows dot, underscore and
+// hyphen.
+//
+// The pattern alone is NOT sufficient, which is the whole reason validRepo is a
+// function rather than one call: `.` and `..` are made entirely of characters
+// the repository half allows, so `a/..` matches happily and yields the wire path
+// /repos/a/../actions/jobs/N. That value goes out with an Authorization header
+// on it, so dot segments are rejected explicitly below.
+var repoPattern = regexp.MustCompile(`^[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}/[A-Za-z0-9._-]{1,100}$`)
 
-func validRepo(repo string) bool { return repoPattern.MatchString(repo) }
+func validRepo(repo string) bool {
+	if !repoPattern.MatchString(repo) {
+		return false
+	}
+	// A path segment of "." or ".." is a traversal, not a name. GitHub rejects
+	// both as repository names anyway, so nothing legitimate is lost.
+	owner, name, _ := strings.Cut(repo, "/")
+	return owner != "." && owner != ".." && name != "." && name != ".."
+}
 
 // hasLabels returns true if every label in required appears in jobLabels (case-insensitive).
 func hasLabels(jobLabels, required []string) bool {
@@ -257,7 +272,7 @@ func (s *Server) scaleUp(ctx context.Context, id int64, repo string) error {
 	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
 
-	next, err := s.apply(ctx, queued, inProgress)
+	next, err := s.apply(ctx)
 	if err != nil {
 		return err
 	}
@@ -292,7 +307,7 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 		return nil
 	}
 
-	next, err := s.apply(ctx, queued, 0)
+	next, err := s.apply(ctx)
 	if err != nil {
 		return err
 	}
@@ -330,11 +345,27 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 //     serialized behind scaleMu, would push the last delivery past GitHub's
 //     timeout. assertDesired covers the suppressed window.
 //
+// It reads the counters ITSELF, under state.mu, rather than taking them from the
+// caller. Callers used to snapshot, release state.mu, and pass the numbers down,
+// and that was safe only while every path that could GROW the work set also held
+// scaleMu. Adoption broke that assumption: markInProgress takes state.mu alone
+// (it must — an in_progress webhook cannot wait behind a Railway round-trip), so
+// a job could be adopted after a caller's snapshot and before this computed,
+// leaving the "never shrink while work is outstanding" floor to be tested
+// against stale zeros and a live job's replica taken away.
+//
+// A window remains between this read and the push below, which is a network
+// call and cannot be inside the lock. assertDesired re-asserts every tick, so
+// the fleet recovers; a job squeezed inside that window does not. Narrowing it
+// to the push is the most that can be done without putting webhooks behind
+// Railway.
+//
 // Callers must hold scaleMu.
-func (s *Server) apply(ctx context.Context, queued, inProgress int) (int, error) {
-	next := max(1, min(queued+inProgress, s.cfg.MaxRunners))
-
+func (s *Server) apply(ctx context.Context) (int, error) {
 	s.state.mu.Lock()
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
+	next := max(1, min(queued+inProgress, s.cfg.MaxRunners))
 	// Two floors, for the two kinds of work that can be running.
 	//
 	// Tracked work: while this process has jobs outstanding, never go below what
@@ -467,7 +498,7 @@ func (s *Server) reapStaleJobs(ctx context.Context) {
 		return
 	}
 
-	next, err := s.apply(ctx, queued, inProgress)
+	next, err := s.apply(ctx)
 	if err != nil {
 		log.Printf("reap: scale error: %v", err)
 		return
@@ -512,7 +543,7 @@ func (s *Server) assertDesired(ctx context.Context) {
 		return
 	}
 
-	next, err := s.apply(ctx, queued, inProgress)
+	next, err := s.apply(ctx)
 	if err != nil {
 		log.Printf("periodic assert: scale error: %v", err)
 		return

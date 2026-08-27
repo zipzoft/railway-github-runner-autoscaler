@@ -833,31 +833,31 @@ func TestState_EveryInsertionGetsADistinctIdentity(t *testing.T) {
 
 func TestReconcile_WarnsAfterConsecutiveCyclesGitHubRecognisesNothing(t *testing.T) {
 	now := testClock()
-	srv, _, _ := newReconcileServer(t, 6, 2, time.Hour, func() time.Time { return now })
+	srv, _, gh := newReconcileServer(t, 6, 2, time.Hour, func() time.Time { return now })
 
 	// Every lookup 404s — the signature of a token without actions:read on the
-	// repositories these jobs run in. Reconcile keeps every entry (correctly),
+	// repository these jobs run in. Reconcile keeps every entry (correctly),
 	// which means the only other evidence of the fault is a leak that never
-	// clears. The blind-cycle counter is what makes it visible.
+	// clears. The per-repository blind run is what makes it visible.
 	for i := 0; i < 3; i++ {
 		srv.reconcile(context.Background())
 	}
 	srv.state.mu.Lock()
-	blind := srv.state.blindCycles
+	blind := srv.state.blindRuns[testRepo]
 	srv.state.mu.Unlock()
 	if blind != 3 {
-		t.Fatalf("blindCycles = %d, want 3", blind)
+		t.Fatalf("blindRuns[%s] = %d, want 3", testRepo, blind)
 	}
 
 	// One resolved lookup clears the run: this is a "nothing is resolvable"
 	// detector, not a "some job was deleted" detector.
-	srv.github.(*fakeGitHubClient).answers[9001] = jobActive
+	gh.answers[9001] = jobActive
 	srv.reconcile(context.Background())
 	srv.state.mu.Lock()
-	blind = srv.state.blindCycles
+	blind = srv.state.blindRuns[testRepo]
 	srv.state.mu.Unlock()
 	if blind != 0 {
-		t.Fatalf("blindCycles = %d after a resolvable cycle, want 0", blind)
+		t.Fatalf("blindRuns[%s] = %d after a resolvable cycle, want 0", testRepo, blind)
 	}
 }
 
@@ -1206,12 +1206,26 @@ func TestHandleWebhook_RejectsAnImplausibleRepository(t *testing.T) {
 }
 
 func TestValidRepo(t *testing.T) {
-	for _, ok := range []string{"zipzoft/products", "a/b", "Org.Name/repo-name_1", "zipzoft/zmepo.io"} {
+	// Real owners: alphanumerics and single interior hyphens, no dots or
+	// underscores — GitHub's own login rule. Real repository names are laxer.
+	for _, ok := range []string{
+		"zipzoft/products", "a/b", "zipzoft/zmepo.io", "zipzoft/cms.zemo.space",
+		"Org-Name/repo-name_1", "zipzoft/jacker-front-end", "zipzoft/1bnj",
+	} {
 		if !validRepo(ok) {
 			t.Errorf("validRepo(%q) = false, want true", ok)
 		}
 	}
-	for _, bad := range []string{"", "noslash", "a/b/c", "../../evil", "a/b?x=1", "a b/c", "a/b\nHost: x", "/b", "a/"} {
+	// The traversal cases are the point, and the earlier version of this test
+	// missed them: "../../evil" has THREE segments, so it was rejected by the
+	// one-slash rule and proved nothing about dot segments. These have two.
+	bad := []string{
+		"", "noslash", "a/b/c", "/b", "a/",
+		"../..", "a/..", "./.", "a/.", "./b", "../b",
+		"a/b?x=1", "a b/c", "a/b\nHost: x", "a/b#frag", "a/b%2f..",
+		"../../evil", "_owner/x", "own.er/x", "-owner/x", "owner-/x",
+	}
+	for _, bad := range bad {
 		if validRepo(bad) {
 			t.Errorf("validRepo(%q) = true, want false", bad)
 		}
@@ -1243,5 +1257,178 @@ func TestReconcile_A404DoesNotMakeARepositoryEligibleForAdoption(t *testing.T) {
 	srv.state.mu.Unlock()
 	if present {
 		t.Fatalf("adopted a job in a repository whose every lookup 404s")
+	}
+}
+
+// --- ATT-487 round-3 findings ----------------------------------------------
+
+func TestApply_SeesAJobAdoptedAfterTheCallerReadTheCounters(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, rail, _ := newReconcileServer(t, 6, 0, 7*time.Hour, clock)
+	srv.state.mu.Lock()
+	srv.state.applied = 2
+	srv.state.bootFloorUntil = now.Add(-time.Minute) // no boot floor to hide behind
+	srv.state.bootFloor = 1
+	srv.state.mu.Unlock()
+
+	// markInProgress adopts while holding state.mu ONLY — it must, because an
+	// in_progress webhook cannot wait behind a Railway round-trip. So a job can
+	// appear after a caller has snapshotted the counters and before apply runs.
+	// When apply took those counts as parameters, it tested its "never shrink
+	// while work is outstanding" floor against stale zeros and pushed 1 on top of
+	// a live job. Reading the counters itself is what closes that.
+	srv.state.mu.Lock()
+	srv.state.inProgress[606] = jobEntry{since: now, repo: testRepo, seq: srv.state.nextSeq()}
+	srv.state.mu.Unlock()
+
+	srv.scaleMu.Lock()
+	next, err := srv.apply(context.Background())
+	srv.scaleMu.Unlock()
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if next < 2 {
+		t.Fatalf("apply pushed %d with a live job tracked and applied=2; calls %v", next, rail.allCalls())
+	}
+}
+
+func TestReconcile_WarnsAboutAPartiallyScopedTokenNamingTheRepository(t *testing.T) {
+	now := testClock()
+	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+
+	const readable, unreadable = "zipzoft/products", "zipzoft/ambhot"
+	srv.state.mu.Lock()
+	srv.state.inProgress[1] = jobEntry{since: now, repo: readable, seq: srv.state.nextSeq()}
+	srv.state.inProgress[2] = jobEntry{since: now, repo: unreadable, seq: srv.state.nextSeq()}
+	srv.state.mu.Unlock()
+	gh.answers[1] = jobActive // readable; job 2 has no answer, so it 404s
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	// The likeliest misconfiguration is PARTIAL scope, and a whole-cycle "was
+	// everything a 404?" counter can never see it: the readable repo resolves
+	// every cycle and resets the run to zero forever. Tracking the run per
+	// repository is what makes the missing one visible.
+	for i := 0; i < 3; i++ {
+		srv.reconcile(context.Background())
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, unreadable) || !strings.Contains(out, "consecutive cycles") {
+		t.Fatalf("no warning naming %s:\n%s", unreadable, out)
+	}
+	if strings.Contains(out, "jobs in "+readable+".") {
+		t.Fatalf("warned about the repository that resolves fine:\n%s", out)
+	}
+	srv.state.mu.Lock()
+	good, bad := srv.state.blindRuns[readable], srv.state.blindRuns[unreadable]
+	srv.state.mu.Unlock()
+	if good != 0 || bad != 3 {
+		t.Fatalf("blindRuns: %s=%d %s=%d, want 0 and 3", readable, good, unreadable, bad)
+	}
+}
+
+func TestReconcile_RevokesAdoptionWhenARepositoryStopsResolving(t *testing.T) {
+	now := testClock()
+	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+	proveRepoReadable(t, srv, gh, testRepo)
+
+	// healthyRepos was a one-way latch. A token that expires, is rotated, or
+	// loses a scope AFTER the latch is set would leave adoption enabled while
+	// every lookup 404s — and a 404 never retires an entry, so an adopted
+	// phantom would hold a replica for the full TTL. Exactly the harm the gate
+	// exists to prevent, merely deferred until the credential goes bad.
+	srv.state.mu.Lock()
+	srv.state.inProgress[11] = jobEntry{since: now, repo: testRepo, seq: srv.state.nextSeq()}
+	srv.state.mu.Unlock()
+	gh.mu.Lock()
+	gh.answers = map[int64]jobLiveness{} // the credential has gone bad
+	gh.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		srv.reconcile(context.Background())
+	}
+
+	srv.state.mu.Lock()
+	stillHealthy := srv.state.healthyRepos[testRepo]
+	srv.state.mu.Unlock()
+	if stillHealthy {
+		t.Fatalf("%s is still licensed for adoption after 3 blind cycles", testRepo)
+	}
+
+	postWebhook(srv, "in_progress", 9999)
+	srv.state.mu.Lock()
+	_, adopted := srv.state.inProgress[9999]
+	srv.state.mu.Unlock()
+	if adopted {
+		t.Fatalf("adopted a job after the repository stopped resolving")
+	}
+}
+
+func TestReconcile_ARepositoryThatResolvesAgainRegainsItsLicence(t *testing.T) {
+	now := testClock()
+	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+	proveRepoReadable(t, srv, gh, testRepo)
+	srv.state.mu.Lock()
+	srv.state.inProgress[11] = jobEntry{since: now, repo: testRepo, seq: srv.state.nextSeq()}
+	srv.state.mu.Unlock()
+
+	gh.mu.Lock()
+	gh.answers = map[int64]jobLiveness{}
+	gh.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		srv.reconcile(context.Background())
+	}
+
+	// Revocation must not be permanent either: a rotated-in good token has to
+	// restore adoption without a restart, or the recovery path is "redeploy".
+	gh.mu.Lock()
+	gh.answers[11] = jobActive
+	gh.mu.Unlock()
+	srv.reconcile(context.Background())
+
+	srv.state.mu.Lock()
+	healthy := srv.state.healthyRepos[testRepo]
+	runs := srv.state.blindRuns[testRepo]
+	srv.state.mu.Unlock()
+	if !healthy || runs != 0 {
+		t.Fatalf("after GitHub answered again: healthy=%v blindRuns=%d, want true and 0", healthy, runs)
+	}
+}
+
+func TestReconcile_DoesNotClaimTheContractionIsWaitingWhenItIsAboutToHappen(t *testing.T) {
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, rail, gh := newReconcileServer(t, 6, 3, 7*time.Hour, clock)
+	// The fleet grew to 5 during the batch, above the boot floor of 3 seeded at
+	// boot. The horizon still stands, but the floor is BELOW what is applied, so
+	// it is not what is pinning the count — a 5→3 contraction lands immediately.
+	srv.state.mu.Lock()
+	srv.state.bootFloor = 3
+	srv.state.applied = 5
+	srv.state.mu.Unlock()
+	for id := int64(9001); id <= 9003; id++ {
+		gh.answers[id] = jobFinished
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	now = now.Add(time.Minute)
+	srv.tick(context.Background())
+
+	// Saying "the contraction waits for the horizon" and then contracting in the
+	// same tick is worse than saying nothing: it is the sentence an operator
+	// would use to decide the service is stuck. The predicate here has to be the
+	// one assertDesired actually decides on.
+	if strings.Contains(buf.String(), "will not fall below") {
+		t.Fatalf("claimed the contraction was held, then contracted anyway:\n%s", buf.String())
+	}
+	if last, ok := rail.lastCall(); !ok || last != 3 {
+		t.Fatalf("fleet at %v after the prune, want 3 (the boot floor); calls %v", last, rail.allCalls())
 	}
 }

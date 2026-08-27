@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+// sortedKeys renders a set deterministically, so a log line does not shuffle
+// between cycles and look like it changed when it did not.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 const (
 	githubAPIURL = "https://api.github.com"
 	// githubAPIVersion pins the REST schema. Without it GitHub is free to serve a
@@ -176,32 +187,63 @@ func (c *githubClient) JobStatus(ctx context.Context, repo string, id int64) (jo
 	}
 }
 
-// noteBlindCycle tracks consecutive reconcile passes that resolved nothing but
-// 404s and warns once the run is long enough to be a configuration fault rather
-// than a coincidence. Without it the 404-keeps-the-entry rule — which is correct
-// — also makes a mis-scoped token completely silent.
-func (s *Server) noteBlindCycle(blind bool) {
-	const blindCycleWarnAfter = 3
+// noteRepoOutcomes records, per repository, whether GitHub resolved anything for
+// it this cycle. It does two jobs that are really one:
+//
+//   - It warns when a repository has gone unresolvable for long enough to be a
+//     configuration fault rather than a coincidence. Without this the
+//     404-keeps-the-entry rule — which is correct — makes a mis-scoped token
+//     completely silent.
+//   - It REVOKES that repository's adoption licence. healthyRepos is otherwise a
+//     one-way latch, and a token that expires, is rotated, or loses a scope
+//     after the latch was set would leave adoption enabled while every lookup
+//     404s. An adopted phantom would then hold a replica for the full TTL: the
+//     precise harm the adoption gate exists to prevent, merely deferred until
+//     the credential goes bad.
+//
+// answered wins over blind for a repository seen in both, because one resolved
+// lookup is proof the token can read it.
+func (s *Server) noteRepoOutcomes(answered, blind map[string]bool) {
+	const warnAfter = 3
+	const repeatEvery = 12 // cycles; one reapInterval each
+
+	type alarm struct {
+		repo string
+		runs int
+	}
+	var alarms []alarm
+	var revoked []string
 
 	s.state.mu.Lock()
-	if !blind {
-		s.state.blindCycles = 0
-		s.state.mu.Unlock()
-		return
+	for repo := range answered {
+		delete(s.state.blindRuns, repo)
 	}
-	s.state.blindCycles++
-	n := s.state.blindCycles
+	for repo := range blind {
+		if answered[repo] {
+			continue
+		}
+		s.state.blindRuns[repo]++
+		n := s.state.blindRuns[repo]
+		if n == warnAfter || (n > warnAfter && (n-warnAfter)%repeatEvery == 0) {
+			alarms = append(alarms, alarm{repo: repo, runs: n})
+		}
+		if n >= warnAfter && s.state.healthyRepos[repo] {
+			delete(s.state.healthyRepos, repo)
+			revoked = append(revoked, repo)
+		}
+	}
 	s.state.mu.Unlock()
 
-	// Repeat roughly hourly rather than once, ever. A mis-scoped token does not
-	// heal on its own, and a single line that scrolled away days ago is not an
-	// alarm anybody will see.
-	const repeatEvery = 12 // ticks; one reapInterval each
-	if n == blindCycleWarnAfter || (n > blindCycleWarnAfter && (n-blindCycleWarnAfter)%repeatEvery == 0) {
+	for _, a := range alarms {
 		log.Printf("[WARN] reconcile: %d consecutive cycles in which GitHub recognised NONE of the tracked "+
-			"jobs. Reconcile is running but retiring nothing, so leaks still clear on the %s horizon only. "+
-			"The usual cause is a GITHUB_TOKEN without actions:read on the repositories these jobs run in",
-			n, s.cfg.StaleJobTTL)
+			"jobs in %s. Reconcile is running but retiring nothing there, so leaks in that repository still "+
+			"clear on the %s horizon only. The usual cause is a GITHUB_TOKEN without actions:read on it",
+			a.runs, a.repo, s.cfg.StaleJobTTL)
+	}
+	for _, repo := range revoked {
+		log.Printf("[WARN] reconcile: no longer adopting untracked jobs in %s — GitHub has stopped "+
+			"resolving lookups there, so an adopted job could not be retired and would hold a replica "+
+			"for the full %s", repo, s.cfg.StaleJobTTL)
 	}
 }
 
@@ -307,6 +349,10 @@ func (s *Server) reconcile(ctx context.Context) {
 	// every 5 minutes and bury the census that actually summarises the cycle.
 	var notFoundIDs, failedIDs []int64
 	var lastErr error
+	// Which repositories 404'd, not just which ids. A count alone cannot tell an
+	// operator WHICH repository the token is missing, and partial scope is the
+	// likeliest way this is misconfigured.
+	notFoundRepos := map[string]bool{}
 	// answered records the repositories GitHub actually resolved a job in this
 	// cycle. It is the evidence markInProgress needs before it will adopt an
 	// untracked job in that repository — see State.healthyRepos.
@@ -334,6 +380,7 @@ func (s *Server) reconcile(ctx context.Context) {
 				"abandoning the rest rather than deepening it", checked, err)
 		case errors.Is(err, errJobNotFound):
 			notFoundIDs = append(notFoundIDs, c.id)
+			notFoundRepos[c.entry.repo] = true
 		case err != nil:
 			failedIDs = append(failedIDs, c.id)
 			lastErr = err
@@ -354,10 +401,11 @@ func (s *Server) reconcile(ctx context.Context) {
 	// repositories produces a service that looks healthy, logs nothing alarming,
 	// and does exactly nothing.
 	if len(notFoundIDs) > 0 {
-		log.Printf("reconcile: GitHub does not recognise %d job(s): %v. Either their runs were deleted or "+
-			"GITHUB_TOKEN cannot read the repositories they ran in. Keeping every one — a 404 is not a "+
-			"completion, and GitHub answers 404 for a repository a token cannot see, so pruning on one "+
-			"would delete live jobs. They clear on the %s horizon", len(notFoundIDs), notFoundIDs, s.cfg.StaleJobTTL)
+		log.Printf("reconcile: GitHub does not recognise %d job(s) %v in %v. Either their runs were deleted "+
+			"or GITHUB_TOKEN cannot read those repositories. Keeping every one — a 404 is not a completion, "+
+			"and GitHub answers 404 for a repository a token cannot see, so pruning on one would delete live "+
+			"jobs. They clear on the %s horizon",
+			len(notFoundIDs), notFoundIDs, sortedKeys(notFoundRepos), s.cfg.StaleJobTTL)
 	}
 	if len(failedIDs) > 0 {
 		log.Printf("reconcile: could not check %d job(s): %v (last error: %v); keeping every one",
@@ -366,10 +414,10 @@ func (s *Server) reconcile(ctx context.Context) {
 	log.Printf("reconcile: checked=%d finished=%d active=%d notfound=%d error=%d (of %d tracked)",
 		checked, len(finished), active, len(notFoundIDs), len(failedIDs), tracked)
 	// A cycle cut short by a rate limit says nothing about whether the token can
-	// see these repositories, so it must not count toward the blind run — in
+	// see these repositories, so it must not count toward any blind run — in
 	// either direction.
 	if !rateLimited {
-		s.noteBlindCycle(checked > 0 && len(notFoundIDs) == checked)
+		s.noteRepoOutcomes(answered, notFoundRepos)
 	}
 
 	if len(answered) > 0 {
@@ -405,7 +453,12 @@ func (s *Server) reconcile(ctx context.Context) {
 	}
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
-	bootHeld := s.clock().Before(s.state.bootFloorUntil) && s.state.bootFloor > 1
+	// The SAME predicate assertDesired uses to decide it has nothing worth
+	// pushing (see server.go). It was `bootFloor > 1` here, which is a different
+	// question: with bootFloor=3 and applied=5 that said the contraction was
+	// being withheld, and then assertDesired contracted 5 to 3 in the very same
+	// tick. Two predicates named the same thing, disagreeing.
+	bootPinsTheCount := s.clock().Before(s.state.bootFloorUntil) && s.state.bootFloor >= s.state.applied
 	bootFloor := s.state.bootFloor
 	bootFloorUntil := s.state.bootFloorUntil
 	s.state.mu.Unlock()
@@ -419,16 +472,16 @@ func (s *Server) reconcile(ctx context.Context) {
 	// running job. The contraction therefore still lands in this same cycle.
 	log.Printf("reconcile: retired %d job(s) GitHub reports complete, %s ahead of the TTL horizon: %v "+
 		"(queued=%d inProgress=%d)", len(pruned), s.cfg.StaleJobTTL, pruned, queued, inProgress)
-	if queued+inProgress == 0 && bootHeld {
+	if queued+inProgress == 0 && bootPinsTheCount {
 		// Retiring the entries is not the same as shrinking the fleet. While the
 		// boot-era floor stands, assertDesired deliberately withholds the
 		// contraction, because jobs that were already running when this process
 		// started are invisible to reconcile too — it can only ask about ids it
 		// tracks. An operator watching for the replica count to fall deserves to
 		// know it is being held on purpose rather than stuck.
-		log.Printf("reconcile: the counters are now clear, but the replica count is still held by the "+
+		log.Printf("reconcile: the counters are now clear, but the replica count will not fall below the "+
 			"boot-era floor of %d until %s — reconcile cannot see jobs that were already running when "+
-			"this process started, so the contraction waits for that horizon",
+			"this process started, so that part of the contraction waits for the horizon",
 			bootFloor, bootFloorUntil.Format(time.RFC3339))
 	}
 }

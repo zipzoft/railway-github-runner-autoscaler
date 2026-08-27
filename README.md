@@ -132,7 +132,7 @@ jobs:
 
 ## zipzoft fork notes
 
-This is zipzoft's fork of `shaezzy/railway-github-runner-autoscaler`, carrying three
+This is zipzoft's fork of `shaezzy/railway-github-runner-autoscaler`, carrying four
 patches on top of upstream:
 
 1. **Project-token auth.** `github-autoscaler` runs with a Railway **project**
@@ -159,7 +159,19 @@ patches on top of upstream:
    boot-era jobs this process can never see — stop a scale decision from
    shrinking a fleet that is mid-job. See `deadlock_test.go` and `seed_test.go`.
 
-**Image:** published to GHCR by `.github/workflows/docker-publish.yml` on every
-push to `main` and on `v*` tags — `ghcr.io/zipzoft/railway-github-runner-autoscaler`.
+4. **Reconcile against GitHub (ATT-487).** ATT-482 removed the deadlock but not
+   the leak that caused it: an id whose `completed` delivery was lost still held
+   a replica until the 7h TTL reaper. With `GITHUB_TOKEN` set, the background
+   tick asks GitHub whether each tracked job is really unfinished and retires the
+   ones it reports completed, so that class of leak clears in one cycle. Only a
+   `200 + "completed"` retires an id — a 404 does not, because GitHub returns 404
+   for a repository the token cannot read. `markInProgress` also adopts a job it
+   never saw queued, once GitHub has proved that repository readable. Unset the
+   token and all of this is inert. See *Reconciling against GitHub* above,
+   `github.go`, and `reconcile_test.go`.
+
+**Image:** built by `.github/workflows/docker-publish.yml` on every event
+(including pull requests, so a Dockerfile that stops building fails a check
+rather than a deploy) and published to GHCR on every push to `main` and on `v*` tags — `ghcr.io/zipzoft/railway-github-runner-autoscaler`.
 Point the Railway service's build at this image instead of the `alpine:3`
 placeholder to remove the "any var-change redeploy reverts to alpine" footgun.

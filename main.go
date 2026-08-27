@@ -116,12 +116,17 @@ type State struct {
 	lastPush       time.Time
 	bootFloor      int
 	bootFloorUntil time.Time
-	// blindCycles counts consecutive reconcile passes in which every single
-	// lookup came back "not found". One such pass is unremarkable; a run of them
-	// is the signature of a token that cannot read the repositories the jobs are
-	// in, which makes reconcile a silent no-op — the exact 7h leak it exists to
-	// remove, with nothing else to show for it.
-	blindCycles int
+	// blindRuns counts, PER REPOSITORY, consecutive reconcile passes in which
+	// every lookup for that repository came back "not found". One such pass is
+	// unremarkable; a run of them is the signature of a token without
+	// actions:read there, which makes reconcile a silent no-op for that repo —
+	// the exact 7h leak it exists to remove, with nothing to show for it.
+	//
+	// Per repository rather than per cycle, because the failure this is most
+	// likely to catch is PARTIAL: a token covering three of four repositories
+	// leaves every cycle with at least one resolved lookup, so a whole-cycle
+	// counter would reset to zero forever and never warn about the fourth.
+	blindRuns map[string]int
 	// healthyRepos holds the repositories GitHub has actually answered a lookup
 	// for. It gates adoption, and it has to be per-repository rather than a
 	// single "reconcile works" flag: a token can hold actions:read on one repo
@@ -244,6 +249,7 @@ func newState(applied int, now time.Time, ttl time.Duration) *State {
 		queued:         make(map[int64]jobEntry),
 		inProgress:     make(map[int64]jobEntry),
 		healthyRepos:   make(map[string]bool),
+		blindRuns:      make(map[string]int),
 		applied:        applied,
 		bootFloor:      applied,
 		bootFloorUntil: now.Add(ttl),
