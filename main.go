@@ -34,14 +34,22 @@ type Config struct {
 	StaleJobTTL   time.Duration
 }
 
-// State tracks each job by GitHub job ID across the queued/in-progress/completed
-// lifecycle. queued and inProgress record the time the job entered that state so
-// reapStaleJobs can detect entries that never received a terminal webhook.
+// State tracks each unfinished job by GitHub job ID. queued and inProgress
+// record the time the job entered that state so reapStaleJobs can detect
+// entries that never received a terminal webhook. A job that has completed is
+// deleted outright and never recorded: it needs no runner, and keeping finished
+// ids in a set that only cleared once inProgress hit zero was what let a single
+// lost webhook grow the set without bound (ATT-482 — it reached 5972 entries).
+//
+// applied is the replica count last pushed to Railway. It is the floor that
+// keeps a mid-batch scale decision from shrinking the fleet out from under a
+// running job, replacing the finished-job accounting that used to serve that
+// purpose by accident.
 type State struct {
 	mu         sync.Mutex
 	queued     map[int64]time.Time
 	inProgress map[int64]time.Time
-	completed  map[int64]struct{}
+	applied    int
 }
 
 // RailwayClient scales the runner service. It is an interface so tests can
@@ -138,7 +146,6 @@ func main() {
 		state: &State{
 			queued:     make(map[int64]time.Time),
 			inProgress: make(map[int64]time.Time),
-			completed:  make(map[int64]struct{}),
 		},
 		client: newRailwayClient(cfg),
 		clock:  time.Now,
@@ -147,12 +154,15 @@ func main() {
 	// In-memory state starts empty on every boot and is deliberately not
 	// reconciled against Railway's live replica count: after a mid-batch restart
 	// the service can't tell an idle replica from one running a job, so forcing a
-	// reset would kill in-flight runners. The next completed batch settles the
-	// count back to 1 (see scaleDown); an orphaned high count with no further
-	// jobs only costs idle memory. For the same reason, an in_progress webhook
-	// for a job whose queued entry was lost on restart is ignored (see
+	// reset would kill in-flight runners. An in_progress webhook for a job whose
+	// queued entry was lost on restart is ignored for the same reason (see
 	// markInProgress), leaving that job untracked until it completes.
-	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready, staleJobTTL=%s", cfg.StaleJobTTL)
+	//
+	// What the fresh state must NOT do is assume the fleet is healthy. applied=0
+	// means "nothing asserted yet", so the first scale decision after boot pushes
+	// a replica count to Railway instead of trusting an unobserved base replica —
+	// the fleet may have lost every runner while this process was not running.
+	log.Printf("startup: counters initialised (queued=0 inProgress=0 applied=0), staleJobTTL=%s", cfg.StaleJobTTL)
 
 	// reapLoop stops when ctx is cancelled by SIGINT/SIGTERM, the same signal
 	// that drives the graceful HTTP shutdown below.
