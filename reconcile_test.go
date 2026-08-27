@@ -889,3 +889,44 @@ func TestGitHubClient_ProbeAcceptsAWorkingCredential(t *testing.T) {
 		t.Fatalf("probe Authorization %q", auth)
 	}
 }
+
+func TestReconcile_KeepsCompletionsAlreadyConfirmedWhenARateLimitCutsTheCycleShort(t *testing.T) {
+	now := testClock()
+	srv, _, gh := newReconcileServer(t, 6, 0, time.Hour, func() time.Time { return now })
+	srv.state.mu.Lock()
+	for i := 1; i <= 3; i++ {
+		srv.state.inProgress[int64(i)] = jobEntry{
+			since: now.Add(time.Duration(i) * time.Second), // 1 oldest, 3 newest
+			repo:  testRepo, seq: srv.state.nextSeq(),
+		}
+	}
+	srv.state.mu.Unlock()
+	gh.answers[1] = jobFinished
+
+	// Job 1 is answered — authoritatively, with a 200 — and only then does GitHub
+	// start refusing. That answer does not become less true because a later
+	// request was throttled, and discarding it would leave a known-dead entry
+	// holding a replica for another cycle.
+	var seen int
+	gh.duringCall = func() {
+		seen++
+		if seen == 2 {
+			gh.mu.Lock()
+			gh.failWith = fmt.Errorf("%w: status 403", errRateLimited)
+			gh.mu.Unlock()
+		}
+	}
+
+	srv.reconcile(context.Background())
+
+	srv.state.mu.Lock()
+	_, one := srv.state.inProgress[1]
+	_, two := srv.state.inProgress[2]
+	srv.state.mu.Unlock()
+	if one {
+		t.Fatalf("discarded a completion GitHub had already confirmed before the rate limit")
+	}
+	if !two {
+		t.Fatalf("pruned job 2, whose lookup was refused — a rate limit is not a completion")
+	}
+}

@@ -303,6 +303,7 @@ func (s *Server) reconcile(ctx context.Context) {
 	// --- lookups, no locks held ---
 	var finished []candidate
 	var checked, active, notFound, failed int
+	rateLimited := false
 	for _, c := range cands {
 		if err := ctx.Err(); err != nil {
 			// The wall-clock budget, not a shortage of ids. Whatever is left is
@@ -315,12 +316,14 @@ func (s *Server) reconcile(ctx context.Context) {
 		checked++
 		switch {
 		case errors.Is(err, errRateLimited):
-			failed++
+			// Stop asking, but keep what has already been answered: the
+			// completions confirmed earlier in this cycle came back 200 and are
+			// no less authoritative for what happened afterwards. Break rather
+			// than return so they still commit and the census still prints.
+			checked-- // the refused request answered nothing
+			rateLimited = true
 			log.Printf("[WARN] reconcile: GitHub rate-limited this cycle after %d lookup(s) (%v); "+
 				"abandoning the rest rather than deepening it", checked, err)
-			checked-- // the refused request answered nothing
-			s.noteBlindCycle(false)
-			return
 		case errors.Is(err, errJobNotFound):
 			notFound++
 			log.Printf("reconcile: GitHub does not recognise job %d in %s — either the run was deleted or "+
@@ -334,6 +337,9 @@ func (s *Server) reconcile(ctx context.Context) {
 		default:
 			active++
 		}
+		if rateLimited {
+			break
+		}
 	}
 
 	// A census every cycle, because the alternative is a feature that cannot be
@@ -342,7 +348,12 @@ func (s *Server) reconcile(ctx context.Context) {
 	// and does exactly nothing.
 	log.Printf("reconcile: checked=%d finished=%d active=%d notfound=%d error=%d (of %d tracked)",
 		checked, len(finished), active, notFound, failed, tracked)
-	s.noteBlindCycle(checked > 0 && notFound == checked)
+	// A cycle cut short by a rate limit says nothing about whether the token can
+	// see these repositories, so it must not count toward the blind run — in
+	// either direction.
+	if !rateLimited {
+		s.noteBlindCycle(checked > 0 && notFound == checked)
+	}
 
 	if len(finished) == 0 {
 		return
