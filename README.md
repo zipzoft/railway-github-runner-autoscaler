@@ -57,7 +57,7 @@ Two rules keep this safe, and both exist because of a real outage (see fork note
 
   Two things this does **not** do, both deliberate:
 
-  - A job whose `queued` delivery never lands is invisible the same way, with no restart involved, and once the horizon has lapsed neither floor covers it. (The common failure keeps the job tracked — `scaleUp` records the id *before* pushing, so a Railway error still leaves it counted — but a delivery GitHub never lands is not recoverable this way.)
+  - A job whose `queued` delivery never lands is invisible the same way, with no restart involved, and once the horizon has lapsed neither floor covers it. (The common failure keeps the job tracked — `scaleUp` records the id *before* pushing, so a Railway error still leaves it counted — but a delivery GitHub never lands is not recoverable this way.) **With `GITHUB_TOKEN` set this specific case is covered**: the job's `in_progress` delivery is adopted, so it becomes tracked after all. What stays uncovered is a job that loses *both* deliveries, and a boot-era job that was already running before this process started and so has no further event to adopt.
   - The floor bounds how far the *count* falls, not *which* replica Railway drops. A contraction from 6 down to a boot floor of 3 is still a contraction, and Railway is free to drop a busy one.
 
   The cost is real: a restart while the fleet is wide holds it wide for that horizon, even when the width was itself a leak — and if the boot read fails, "wide" means `MAX_RUNNERS`. That is bounded over-provisioning, and it is the recoverable direction. **Reconcile does not remove this horizon** (see below): it can only ask about ids it already tracks, and a boot-era job is one it never saw.
