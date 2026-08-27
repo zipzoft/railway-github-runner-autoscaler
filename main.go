@@ -16,11 +16,28 @@ import (
 )
 
 const (
-	defaultMaxRunners     = 3
-	defaultPort           = "8080"
-	defaultRunnerLabel    = "self-hosted,railway"
-	defaultStaleJobTTLMin = 360 // 6h: far beyond any realistic CI job duration on this fleet
+	defaultMaxRunners  = 3
+	defaultPort        = "8080"
+	defaultRunnerLabel = "self-hosted,railway"
+	// 7h. GitHub's own default job timeout is 360 minutes, so a 360 TTL leaves
+	// ZERO margin: a job legitimately running to that default would be reaped
+	// while alive, and reapStaleJobs would then scale the fleet down under it.
+	// 420 keeps a real hour of headroom over the longest job GitHub will allow
+	// by default. A workflow setting timeout-minutes above 420 needs
+	// STALE_JOB_TTL_MINUTES raised to match.
+	defaultStaleJobTTLMin = 420
 	reapInterval          = 5 * time.Minute
+	// coalesceWindow suppresses a re-push of an UNCHANGED replica count made
+	// within this long of the last successful push. It exists to bound the call
+	// amplification of asserting on every webhook (a 30-job burst would
+	// otherwise issue 30 serialized Railway mutations behind scaleMu, and the
+	// last webhook in the burst can outlive GitHub's delivery timeout). Recovery
+	// does not depend on the suppressed calls: assertDesired re-pushes every
+	// reapInterval for as long as any job is outstanding.
+	coalesceWindow = 30 * time.Second
+	// seedTimeout bounds the boot-time replica read. The read holds no locks, so
+	// nothing waits on it — not the listener, not a webhook.
+	seedTimeout = 10 * time.Second
 )
 
 type Config struct {
@@ -34,20 +51,52 @@ type Config struct {
 	StaleJobTTL   time.Duration
 }
 
-// State tracks each job by GitHub job ID across the queued/in-progress/completed
-// lifecycle. queued and inProgress record the time the job entered that state so
-// reapStaleJobs can detect entries that never received a terminal webhook.
+// State tracks each unfinished job by GitHub job ID. queued and inProgress
+// record the time the job entered that state so reapStaleJobs can detect
+// entries that never received a terminal webhook. A job that has completed is
+// deleted outright and never recorded: it needs no runner, and keeping finished
+// ids in a set that only cleared once inProgress hit zero was what let a single
+// lost webhook grow the set without bound (ATT-482 — it reached 5972 entries).
+//
+// applied is the replica count last accepted by Railway. It is the floor that
+// keeps a scale decision from shrinking the fleet out from under a running job,
+// replacing the finished-job accounting that used to serve that purpose by
+// accident. lastPush is when that value was pushed, and drives coalescing.
+//
+// bootFloor and bootFloorUntil cover the jobs that were already running when
+// this process started. Those jobs are permanently invisible to it: markInProgress
+// refuses to adopt an id that was never queued here, so a restart-era job is
+// never tracked and its completion is never counted. An empty pair of counters
+// therefore does NOT mean the fleet is idle until enough time has passed that no
+// boot-era job could still be running.
+//
+// Tracking cannot close this. Deciding on "a drain I watched" only defers the
+// harm by one job cycle: a new job arrives, runs, finishes, the counters return
+// to zero, and SetReplicas(1) cancels every boot-era job still going. The only
+// honest bound is time, so bootFloor holds until StaleJobTTL has elapsed since
+// boot — the same horizon beyond which this service already declares a job dead.
+//
+// The cost is real and worth stating: a restart while the fleet is wide holds it
+// wide for that horizon, even if the width was itself a leak. That is bounded
+// over-provisioning, and it is the recoverable direction. Reconciling against
+// GitHub's own view of in-progress jobs is what removes the horizon entirely.
 type State struct {
-	mu         sync.Mutex
-	queued     map[int64]time.Time
-	inProgress map[int64]time.Time
-	completed  map[int64]struct{}
+	mu             sync.Mutex
+	queued         map[int64]time.Time
+	inProgress     map[int64]time.Time
+	applied        int
+	lastPush       time.Time
+	bootFloor      int
+	bootFloorUntil time.Time
 }
 
 // RailwayClient scales the runner service. It is an interface so tests can
 // substitute a fake and assert on calls without making network requests.
 type RailwayClient interface {
 	SetReplicas(ctx context.Context, n int) error
+	// Replicas reports the count Railway currently has configured. It is read
+	// once at boot to seed the replica floor; see newState.
+	Replicas(ctx context.Context) (int, error)
 }
 
 type Server struct {
@@ -55,6 +104,9 @@ type Server struct {
 	state  *State
 	client RailwayClient
 	clock  func() time.Time
+	// tickInterval overrides reapInterval for tests that need the background loop
+	// to run at a testable cadence. Zero means reapInterval.
+	tickInterval time.Duration
 	// scaleMu serializes the compute-and-apply of the replica count across
 	// scaleUp/scaleDown/reapStaleJobs so concurrent webhooks and the reap loop
 	// can't push a stale or out-of-order numReplicas to Railway. It is separate
@@ -122,6 +174,55 @@ func loadConfig() (Config, error) {
 	}, nil
 }
 
+// newState builds the boot state. It exists so the floor cannot be seeded one
+// way in production and another in a test: getting that seed wrong is the
+// difference between reviving a dead fleet and cancelling live CI jobs.
+//
+// The floor starts at the cap and the boot horizon starts running immediately,
+// so the fleet is protected from the very first webhook — before seedFloorOnce
+// has had a chance to refine the value downward against reality.
+func newState(applied int, now time.Time, ttl time.Duration) *State {
+	return &State{
+		queued:         make(map[int64]time.Time),
+		inProgress:     make(map[int64]time.Time),
+		applied:        applied,
+		bootFloor:      applied,
+		bootFloorUntil: now.Add(ttl),
+	}
+}
+
+// seedFloor reads the replica count Railway currently has and returns it as the
+// starting floor. The job counters legitimately start empty on every boot, but
+// the floor must NOT: a fresh process cannot tell an idle replica from one
+// running a job, and the two ways of being wrong are not symmetric. Assuming the
+// fleet is healthy leaves a dead one asleep — that is ATT-482. Assuming it is
+// idle makes the first scale decision push a count DOWN, and Railway is free to
+// drop any replica when the count shrinks, including one mid-job: a deploy of
+// this service during a busy CI batch would cancel the jobs it was supposed to
+// be serving.
+//
+// On a read failure the floor falls back to the cap. That over-provisions for
+// one batch, which is the recoverable direction; the floor releases itself at
+// the first genuine drain either way.
+func seedFloor(ctx context.Context, client RailwayClient, maxRunners int) int {
+	n, err := client.Replicas(ctx)
+	if err != nil {
+		log.Printf("[WARN] could not read current replica count (%v); seeding the floor at the cap "+
+			"%d so the first scale decision cannot shrink a fleet that may be mid-job", err, maxRunners)
+		return maxRunners
+	}
+	if n > maxRunners {
+		// The fleet is wider than the configured cap — normally because
+		// MAX_RUNNERS was lowered since the last scale. The next decision will
+		// pull it down to the cap, and Railway may drop a replica that is
+		// mid-job to do it. Say so, because the alternative reading of a sudden
+		// job cancellation is a much longer hunt.
+		log.Printf("[WARN] Railway reports %d replicas, above MAX_RUNNERS=%d; the next scale "+
+			"decision will contract the fleet to the cap and may drop a replica mid-job", n, maxRunners)
+	}
+	return max(1, min(n, maxRunners))
+}
+
 func main() {
 	log.SetOutput(os.Stdout)
 
@@ -135,28 +236,44 @@ func main() {
 
 	srv := &Server{
 		cfg: cfg,
-		state: &State{
-			queued:     make(map[int64]time.Time),
-			inProgress: make(map[int64]time.Time),
-			completed:  make(map[int64]struct{}),
-		},
+		// Start the floor at the cap. seedFloorOnce refines it from Railway's
+		// live count moments later; until then the cap is the value that cannot
+		// shrink a fleet which may be mid-job.
+		state:  newState(cfg.MaxRunners, time.Now(), cfg.StaleJobTTL),
 		client: newRailwayClient(cfg),
 		clock:  time.Now,
 	}
 
-	// In-memory state starts empty on every boot and is deliberately not
-	// reconciled against Railway's live replica count: after a mid-batch restart
-	// the service can't tell an idle replica from one running a job, so forcing a
-	// reset would kill in-flight runners. The next completed batch settles the
-	// count back to 1 (see scaleDown); an orphaned high count with no further
-	// jobs only costs idle memory. For the same reason, an in_progress webhook
-	// for a job whose queued entry was lost on restart is ignored (see
-	// markInProgress), leaving that job untracked until it completes.
-	log.Printf("startup: counters initialised (queued=0 inProgress=0), base replica ready, staleJobTTL=%s", cfg.StaleJobTTL)
+	// The job counters start empty on every boot and are deliberately not
+	// reconciled against GitHub: this process can't tell an idle replica from one
+	// running a job, so an in_progress webhook for a job whose queued entry was
+	// lost on restart is ignored rather than resurrected (see markInProgress),
+	// leaving that job untracked until it completes.
+	//
+	// The replica floor is the opposite case and must NOT start empty — assuming
+	// the fleet is idle would make the first scale decision shrink a fleet that
+	// may be mid-job. It starts at the cap and is refined from Railway below.
+	log.Printf("startup: counters initialised (queued=0 inProgress=0), replica floor at cap %d pending seed, staleJobTTL=%s",
+		cfg.MaxRunners, cfg.StaleJobTTL)
 
 	// reapLoop stops when ctx is cancelled by SIGINT/SIGTERM, the same signal
 	// that drives the graceful HTTP shutdown below.
 	go srv.reapLoop(ctx)
+
+	// Seed the floor concurrently with serving rather than before it. Reading it
+	// first would block the listener on a Railway round-trip, and two things go
+	// wrong when that read is slow: the port opens too late for the deploy
+	// healthcheck, and any webhook delivered in the meantime is refused. A
+	// refused delivery is NOT safely retried — GitHub does not guarantee
+	// automatic redelivery of a connection it could not establish — and a job
+	// this process never records is a job assertDesired can never assert for,
+	// which is the ATT-482 symptom class all over again. seedFloorOnce holds
+	// scaleMu, so a webhook that arrives first is ordered, not raced.
+	go func() {
+		seedCtx, cancel := context.WithTimeout(ctx, seedTimeout)
+		defer cancel()
+		srv.seedFloorOnce(seedCtx)
+	}()
 
 	httpSrv := newHTTPServer(":"+cfg.Port, srv)
 

@@ -124,34 +124,42 @@ func TestRailwayClient_SetReplicas_TimesOut(t *testing.T) {
 
 func TestScaleUp_PropagatesClientError(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
-	if err := srv.scaleUp(context.Background(), 1); err != nil { // total==1, base replica, no call
+	if err := srv.scaleUp(context.Background(), 1); err != nil { // 1 unfinished job → SetReplicas(1)
 		t.Fatalf("scaleUp(1): %v", err)
 	}
 	client.err = fmt.Errorf("railway down")
-	if err := srv.scaleUp(context.Background(), 2); err == nil { // total==2, real SetReplicas
+	if err := srv.scaleUp(context.Background(), 2); err == nil { // 2 unfinished → SetReplicas(2)
 		t.Fatal("expected scaleUp to propagate the client error")
 	}
 }
 
 func TestScaleDown_PropagatesClientError(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
-	if err := srv.scaleUp(context.Background(), 1); err != nil {
-		t.Fatalf("scaleUp(1): %v", err)
+	ctx := context.Background()
+	// Two jobs, so draining them changes the count (2 → 1) and the push is not
+	// coalesced away as a repeat of an unchanged value.
+	for _, id := range []int64{1, 2} {
+		if err := srv.scaleUp(ctx, id); err != nil {
+			t.Fatalf("scaleUp(%d): %v", id, err)
+		}
+		srv.markInProgress(id)
 	}
-	srv.markInProgress(1)
+	if err := srv.scaleDown(ctx, 1); err != nil {
+		t.Fatalf("scaleDown(1): %v", err) // job 2 still in progress, replicas held
+	}
 	client.err = fmt.Errorf("railway down")
-	if err := srv.scaleDown(context.Background(), 1); err == nil { // inProgress→0, real SetReplicas
+	if err := srv.scaleDown(ctx, 2); err == nil { // inProgress→0, real SetReplicas
 		t.Fatal("expected scaleDown to propagate the client error")
 	}
 }
 
 func TestHandleWebhook_ScaleFailureReturns500(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
-	if rec := postWebhook(srv, "queued", 1); rec.Code != http.StatusOK { // base replica, no call
+	if rec := postWebhook(srv, "queued", 1); rec.Code != http.StatusOK { // 1 unfinished → SetReplicas(1)
 		t.Fatalf("queued(1): status=%d", rec.Code)
 	}
 	client.err = fmt.Errorf("railway down")
-	rec := postWebhook(srv, "queued", 2) // total==2 → SetReplicas fails
+	rec := postWebhook(srv, "queued", 2) // 2 unfinished → SetReplicas fails
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 when scaling fails, got %d body=%s", rec.Code, rec.Body)
 	}
@@ -251,7 +259,7 @@ func TestHandleWebhook_ScalingSurvivesRequestCancellation(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
 	client.respectCtx = true
 
-	if rec := postWebhook(srv, "queued", 1); rec.Code != http.StatusOK { // base replica, no call
+	if rec := postWebhook(srv, "queued", 1); rec.Code != http.StatusOK { // 1 unfinished → SetReplicas(1)
 		t.Fatalf("queued(1): status=%d", rec.Code)
 	}
 

@@ -36,13 +36,33 @@ This autoscaler listens for GitHub `workflow_job` webhook events and automatical
 
 ## How It Works
 
-The autoscaler tracks each job by its GitHub job ID across three states: queued, in-progress, and complete.
+The autoscaler tracks each **unfinished** job by its GitHub job ID. A completed job is deleted outright — it needs no runner, so it is not counted and not remembered.
 
-- **`queued`** — job ID is added to the queued set. If this is the first job, the base replica handles it with no API call. For concurrent jobs, `setReplicas(N)` is called to add more replicas. Jobs above `MAX_RUNNERS` are tracked but wait for the current batch to finish.
-- **`in_progress`** — job ID moves from queued to in-progress. No scaling call is made — a replica is already running for it.
-- **`completed`** — job ID is removed from in-progress. If other jobs are still in-progress, replicas are left unchanged. Once **all in-progress jobs are done**, the autoscaler calls `setReplicas` — either to pick up any remaining queued jobs, or to reset back to 1 replica if everything is complete.
+The replica count it wants is always the same expression:
 
-> **Note:** This approach is best suited for projects with infrequent or bursty CI workloads. The base replica stays running at all times (consuming minimal memory while idle), scaling up for concurrent jobs and resetting back to 1 when all jobs are done. If your runners are consistently running many concurrent jobs, consider adjusting `MAX_RUNNERS` accordingly.
+```
+desired = clamp(queued + inProgress, 1, MAX_RUNNERS)
+```
+
+- **`queued`** — job ID is added to the queued set, then `setReplicas(desired)` is called. Jobs above `MAX_RUNNERS` do not get their own replica, but the count is still **asserted at the cap** rather than left unmanaged.
+- **`in_progress`** — job ID moves from queued to in-progress. No scaling call — the totals are unchanged, and a replica is already running for it.
+- **`completed`** — job ID is removed from both sets. While other jobs are still in progress the count is held; once the batch fully drains, `setReplicas` either picks up the remaining queued jobs or resets to 1.
+
+Two rules keep this safe, and both exist because of a real outage (see fork note 3):
+
+- **The count is asserted, never assumed.** Every scale decision pushes a value, including when the backlog is over the cap and when the value is unchanged. That push is the only thing that can revive a fleet whose replicas died unobserved. Repeat pushes of an unchanged value are coalesced within a 30s window, and the background tick re-asserts every 5 minutes for as long as any job is outstanding — so recovery never depends on another webhook arriving.
+- **The count never shrinks while *tracked* work is outstanding.** Railway may drop any replica when `numReplicas` decreases, including one mid-job, so while this process has jobs outstanding the count only holds or rises.
+
+  Note the word *tracked*, because it is the caveat — and boot-era jobs are the largest class of untracked work, not the only one. **Jobs already running when the process starts are invisible to it forever** — `markInProgress` refuses to adopt an id it never queued, so a restart-era job is never counted and its completion never observed. Empty counters after a restart mean "I know nothing", not "the fleet is idle", and no sequence of webhooks can tell those apart: deciding on a drain the process *did* watch only defers the harm by one job cycle. So a second floor, seeded from Railway's live count at boot, holds for `STALE_JOB_TTL_MINUTES` — the same horizon past which this service already declares a job dead — and time, not tracking, is what releases it.
+
+  Two things this does **not** do, both deliberate:
+
+  - A job whose `queued` delivery never lands is invisible the same way, with no restart involved, and once the horizon has lapsed neither floor covers it. (The common failure keeps the job tracked — `scaleUp` records the id *before* pushing, so a Railway error still leaves it counted — but a delivery GitHub never lands is not recoverable this way.)
+  - The floor bounds how far the *count* falls, not *which* replica Railway drops. A contraction from 6 down to a boot floor of 3 is still a contraction, and Railway is free to drop a busy one.
+
+  The cost is real: a restart while the fleet is wide holds it wide for that horizon, even when the width was itself a leak — and if the boot read fails, "wide" means `MAX_RUNNERS`. That is bounded over-provisioning, and it is the recoverable direction. Reconciling against GitHub's own view of in-progress jobs is what would remove the horizon.
+
+> **Note:** This approach is best suited for projects with infrequent or bursty CI workloads. One replica stays running at all times (consuming minimal memory while idle), scaling up for concurrent jobs and resetting back to 1 when all jobs are done. If your runners are consistently running many concurrent jobs, consider adjusting `MAX_RUNNERS` accordingly.
 
 ## Prerequisites
 
@@ -61,7 +81,7 @@ The template creates two services:
 | `RAILWAY_API_TOKEN` | Generate at [railway.app/account/tokens](https://railway.app/account/tokens) (this fork sends it as `Project-Access-Token` — use a **project** token) |
 | `RAILWAY_RUNNER_SERVICE_ID` | Auto-filled in template from the **github-runner** service |
 | `MAX_RUNNERS` | Optional, default `3` |
-| `STALE_JOB_TTL_MINUTES` | Optional, default `360` (6h) — safety-net TTL for jobs whose terminal webhook was never received |
+| `STALE_JOB_TTL_MINUTES` | Optional, default `420` (7h) — safety-net TTL for jobs whose terminal webhook was never received. Also the horizon for the boot-era replica floor. Keep it above your longest `timeout-minutes`; GitHub's own default is 360 |
 
 **github-runner** (`myoung34/github-runner:latest`)
 | Variable | Description |
@@ -94,7 +114,7 @@ jobs:
 
 ## zipzoft fork notes
 
-This is zipzoft's fork of `shaezzy/railway-github-runner-autoscaler`, carrying two
+This is zipzoft's fork of `shaezzy/railway-github-runner-autoscaler`, carrying three
 patches on top of upstream:
 
 1. **Project-token auth.** `github-autoscaler` runs with a Railway **project**
@@ -106,10 +126,20 @@ patches on top of upstream:
    without ever firing `in_progress`. `scaleDown` now retires the job id from
    *both* `queued` and `inProgress` on every `completed` event, so the queued
    count always returns to zero when nothing is running. A periodic
-   `reapStaleJobs` sweep (`STALE_JOB_TTL_MINUTES`, default 360 = 6h) is a
+   `reapStaleJobs` sweep (`STALE_JOB_TTL_MINUTES`, default 420 = 7h) is a
    defense-in-depth safety net for the separate, much rarer case of a
    completely lost webhook delivery. See `server_test.go` for the regression
    coverage, in particular `TestScaleDown_RepeatedCancelWhileQueued_NeverLeaksAcrossManyBatches`.
+3. **Assert, never assume (ATT-482).** On 2026-08-27 the fleet deadlocked for
+   2.5h: four `completed` webhooks were lost, `scaleDown` therefore never
+   cleared the finished-job set, that set was summed into the total compared
+   against `MAX_RUNNERS`, and once the total passed the cap `scaleUp` returned
+   **without calling `setReplicas` at all**. No runner started, so no job
+   completed, so no webhook arrived to unwind the count. The finished-job set is
+   gone, the count is asserted on every decision (coalesced, plus a periodic
+   re-assert), and two replica floors — one for tracked work, one covering the
+   boot-era jobs this process can never see — stop a scale decision from
+   shrinking a fleet that is mid-job. See `deadlock_test.go` and `seed_test.go`.
 
 **Image:** published to GHCR by `.github/workflows/docker-publish.yml` on every
 push to `main` and on `v*` tags — `ghcr.io/zipzoft/railway-github-runner-autoscaler`.

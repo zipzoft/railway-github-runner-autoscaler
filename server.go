@@ -151,9 +151,9 @@ func (s *Server) markInProgress(id int64) {
 		// in_progress only legitimately follows a queued we recorded. If the id
 		// isn't queued it's a late, duplicate, or out-of-order delivery - most
 		// importantly an in_progress retried after the job already completed and
-		// the batch settled (which clears completed). Ignore it rather than
-		// resurrecting a phantom in-progress job that would inflate later counts
-		// until the TTL reaper cleans it up.
+		// was deleted from every set. Ignore it rather than resurrecting a phantom
+		// in-progress job, which would hold the fleet above its idle baseline
+		// until the TTL reaper cleaned it up.
 		s.state.mu.Unlock()
 		log.Printf("in_progress ignored: job %d is not queued (late or out-of-order webhook)", id)
 		return
@@ -172,27 +172,20 @@ func (s *Server) scaleUp(ctx context.Context, id int64) error {
 
 	s.state.mu.Lock()
 	s.state.queued[id] = s.clock()
-	total := len(s.state.queued) + len(s.state.inProgress) + len(s.state.completed)
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
-	completed := len(s.state.completed)
 	s.state.mu.Unlock()
 
-	if total == 1 {
-		log.Printf("scaled up: replicas=1 (base replica handles first job, id=%d)", id)
-		return nil
-	}
-
-	if total > s.cfg.MaxRunners {
-		log.Printf("at max runners (%d), job %d queued and waiting (queued=%d inProgress=%d completed=%d)",
-			s.cfg.MaxRunners, id, queued, inProgress, completed)
-		return nil
-	}
-
-	if err := s.client.SetReplicas(ctx, total); err != nil {
+	next, err := s.apply(ctx, queued, inProgress)
+	if err != nil {
 		return err
 	}
-	log.Printf("scaled up: replicas=%d (job id=%d, queued=%d inProgress=%d completed=%d)", total, id, queued, inProgress, completed)
+	if queued+inProgress > s.cfg.MaxRunners {
+		log.Printf("at max runners (%d): job %d waiting behind the backlog, replicas held at %d (queued=%d inProgress=%d)",
+			s.cfg.MaxRunners, id, next, queued, inProgress)
+		return nil
+	}
+	log.Printf("scaled up: replicas=%d (job id=%d, queued=%d inProgress=%d)", next, id, queued, inProgress)
 	return nil
 }
 
@@ -207,65 +200,142 @@ func (s *Server) scaleDown(ctx context.Context, id int64) error {
 	// set and the queued count leaks upward forever.
 	delete(s.state.queued, id)
 	delete(s.state.inProgress, id)
-	s.state.completed[id] = struct{}{}
 	queued := len(s.state.queued)
 	inProgress := len(s.state.inProgress)
 	s.state.mu.Unlock()
 
 	if inProgress > 0 {
-		// Decreasing the replicas while jobs are still in progress can cause them to be killed before completion, so we wait until all in-progress jobs are done before scaling down.
+		// Decreasing the replicas while jobs are still in progress can cause them
+		// to be killed before completion, so hold the count until the batch drains.
 		log.Printf("scaled down: job %d complete, queued=%d inProgress=%d, replicas unchanged", id, queued, inProgress)
 		return nil
 	}
 
-	next, err := s.applyAndClear(ctx, queued)
+	next, err := s.apply(ctx, queued, 0)
 	if err != nil {
 		return err
 	}
 	if queued == 0 {
-		log.Printf("scaled down: all jobs complete, reset to 1 replica")
+		log.Printf("scaled down: all jobs complete, replicas=%d", next)
 	} else {
 		log.Printf("scaled down: in-progress batch done, resuming %d pending job(s) with %d replica(s)", queued, next)
 	}
 	return nil
 }
 
-// applyAndClear sets the replica count for the given still-queued job count
-// (never below 1, never above MaxRunners) and clears the completed set, which
-// no longer needs counting once the in-progress batch has drained. completed is
-// cleared regardless of whether the replica update succeeds, so a failed call
-// can't leave stale ids inflating later scale decisions. Returns the applied
-// count. Callers must hold scaleMu.
-func (s *Server) applyAndClear(ctx context.Context, queued int) (int, error) {
-	next := max(1, min(queued, s.cfg.MaxRunners))
+// apply pushes the replica count the current work set needs and returns the
+// value applied. One replica per unfinished job, clamped to [1, MaxRunners]:
+// finished jobs are not counted, because a completed job needs no runner.
+//
+// Three properties matter, and the first two were missing before ATT-482:
+//
+//  1. It is called on EVERY scale decision, including when the backlog is over
+//     the cap. Bailing out with "at max runners" instead meant no runner could
+//     start, so no job could complete, so no terminal webhook could arrive to
+//     unwind the count: a closed loop that held CI down for 2.5h.
+//
+//  2. While any job is outstanding the count never goes DOWN. Railway is free to
+//     drop any replica when numReplicas shrinks, including one mid-job, so
+//     neither a newly-queued job nor a restart of this process may shrink a fleet
+//     that is still working. state.applied is that floor, seeded from Railway's
+//     live count at boot (see seedFloor, with the cap as the fallback). A second
+//     floor covers the jobs that were already running at boot and can never be
+//     tracked; it expires on the StaleJobTTL horizon rather than on any observed
+//     drain, because no sequence of webhooks can prove an invisible job finished.
+//
+//  3. An unchanged count is re-pushed, but not more often than coalesceWindow.
+//     Re-asserting is what revives a fleet whose replicas died unobserved, so it
+//     cannot be skipped outright; issuing it on all 30 webhooks of a burst,
+//     serialized behind scaleMu, would push the last delivery past GitHub's
+//     timeout. assertDesired covers the suppressed window.
+//
+// Callers must hold scaleMu.
+func (s *Server) apply(ctx context.Context, queued, inProgress int) (int, error) {
+	next := max(1, min(queued+inProgress, s.cfg.MaxRunners))
+
 	s.state.mu.Lock()
-	s.state.completed = make(map[int64]struct{})
+	// Two floors, for the two kinds of work that can be running.
+	//
+	// Tracked work: while this process has jobs outstanding, never go below what
+	// it last pushed.
+	clampedBy := ""
+	if queued+inProgress > 0 && next < s.state.applied {
+		next = s.state.applied
+		clampedBy = "tracked work still outstanding"
+	}
+	// Boot-era work: jobs already running when this process started are
+	// permanently invisible to it, so its counters reading zero proves nothing
+	// until no such job could still be alive. See State.
+	if s.clock().Before(s.state.bootFloorUntil) && next < s.state.bootFloor {
+		next = s.state.bootFloor
+		clampedBy = fmt.Sprintf("boot-era floor, held until %s",
+			s.state.bootFloorUntil.Format(time.RFC3339))
+	}
+	unchanged := next == s.state.applied
+	recent := !s.state.lastPush.IsZero() && s.clock().Sub(s.state.lastPush) < coalesceWindow
 	s.state.mu.Unlock()
-	return next, s.client.SetReplicas(ctx, next)
+
+	if unchanged && recent {
+		return next, nil
+	}
+
+	if err := s.client.SetReplicas(ctx, next); err != nil {
+		// Leave applied untouched. If the push failed the fleet may still be
+		// larger than we asked for, and a stale-high floor over-provisions
+		// rather than shrinking under a running job.
+		return next, err
+	}
+
+	s.state.mu.Lock()
+	s.state.applied = next
+	s.state.lastPush = s.clock()
+	s.state.mu.Unlock()
+
+	if clampedBy != "" {
+		// The healthy signal that a floor is doing its job. Without it the only
+		// visible evidence is a replica count that silently refuses to fall, and
+		// an operator watching a deploy cannot tell that from a stuck service.
+		log.Printf("replicas held at %d rather than %d: %s",
+			next, max(1, min(queued+inProgress, s.cfg.MaxRunners)), clampedBy)
+	}
+	return next, nil
 }
 
-// reapLoop periodically calls reapStaleJobs until ctx is cancelled.
+// reapLoop runs the background tick until ctx is cancelled.
 func (s *Server) reapLoop(ctx context.Context) {
-	ticker := time.NewTicker(reapInterval)
+	every := s.tickInterval
+	if every == 0 {
+		every = reapInterval
+	}
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.reapStaleJobs(ctx)
+			s.tick(ctx)
 		}
 	}
 }
 
+// tick is one pass of the background loop: purge entries whose terminal webhook
+// never arrived, then re-assert the replica count the remaining work implies.
+// Both halves are needed — the reap alone cannot revive a fleet, and the assert
+// alone cannot clear a phantom.
+func (s *Server) tick(ctx context.Context) {
+	s.reapStaleJobs(ctx)
+	s.assertDesired(ctx)
+}
+
 // reapStaleJobs is a defense-in-depth safety net, not the primary leak fix
-// (that's the delete-from-queued-in-scaleDown change above). It protects
+// (that is the delete-from-queued-in-scaleDown change above). It protects
 // against a webhook delivery that is lost entirely - e.g. GitHub retries
 // exhausted while the service was down - which would otherwise leak an id
 // forever with no terminal event to clean it up. Any queued/inProgress entry
-// older than cfg.StaleJobTTL is treated as abandoned and purged; the TTL
-// default (6h) is far beyond any realistic job duration on this fleet so it
-// never fires during normal operation.
+// older than cfg.StaleJobTTL is treated as abandoned and purged. The default is
+// 420 minutes, an hour clear of GitHub's own default job timeout of 360 — see
+// defaultStaleJobTTLMin for why that margin is not optional.
 func (s *Server) reapStaleJobs(ctx context.Context) {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
@@ -299,12 +369,97 @@ func (s *Server) reapStaleJobs(ctx context.Context) {
 		return
 	}
 
-	next, err := s.applyAndClear(ctx, queued)
+	next, err := s.apply(ctx, queued, inProgress)
 	if err != nil {
 		log.Printf("reap: scale error: %v", err)
 		return
 	}
 	log.Printf("reap: replicas set to %d after stale-job cleanup (queued=%d)", next, queued)
+}
+
+// assertDesired re-pushes the replica count the tracked work implies, in either
+// direction, so neither correction depends on a webhook arriving.
+//
+// Up: webhooks fire on job state CHANGES, and a queued job that no runner ever
+// picks up has no further state to change. Without this, a fleet that died after
+// the last job was queued sat until StaleJobTTL. This is what makes the
+// no-deadlock guarantee unconditional instead of dependent on CI staying busy.
+//
+// Down: a scale-down push that fails leaves applied stale-high on purpose (see
+// apply), and nothing else would ever retry it — the batch is over, so no
+// further webhook will call apply. Left alone that bills a full-width fleet
+// until the next batch happens to drain successfully.
+//
+// The down direction is DEFERRED, not abandoned, while the boot-era floor is
+// what pins the count: re-pushing a value that floor is already holding
+// corrects nothing and would churn Railway once per tick for the whole horizon.
+// It resumes the moment the horizon lapses.
+func (s *Server) assertDesired(ctx context.Context) {
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
+	s.state.mu.Lock()
+	queued := len(s.state.queued)
+	inProgress := len(s.state.inProgress)
+	// The count is only worth correcting downward if something other than the
+	// boot-era floor is holding it up. While that floor is what pins the fleet,
+	// re-pushing the value it pins achieves nothing and would issue one Railway
+	// mutation per tick for the whole horizon — needless churn, and needless
+	// exercise of the assumption that an unchanged update is inert.
+	bootHeld := s.clock().Before(s.state.bootFloorUntil) && s.state.bootFloor >= s.state.applied
+	contractable := s.state.applied > 1 && !bootHeld
+	s.state.mu.Unlock()
+
+	if queued+inProgress == 0 && !contractable {
+		return
+	}
+
+	next, err := s.apply(ctx, queued, inProgress)
+	if err != nil {
+		log.Printf("periodic assert: scale error: %v", err)
+		return
+	}
+	log.Printf("periodic assert: replicas=%d (queued=%d inProgress=%d)", next, queued, inProgress)
+}
+
+// seedFloorOnce refines the replica floor from Railway's live count, but only
+// while nothing has been pushed yet. It runs concurrently with the HTTP server
+// so a slow or hung Railway backend cannot delay the listener binding and fail
+// the deploy healthcheck, and it holds scaleMu so it cannot interleave with a
+// scale decision: a webhook arriving first simply waits, and one that already
+// pushed keeps its value rather than having the pre-boot count overwrite it.
+func (s *Server) seedFloorOnce(ctx context.Context) {
+	// The Railway round-trip happens with NO locks held. Holding scaleMu across
+	// it would block every webhook for the length of the read, and GitHub gives
+	// a delivery 10 seconds before it gives up — the same lost-delivery problem
+	// binding late was meant to avoid.
+	floor := seedFloor(ctx, s.client, s.cfg.MaxRunners)
+
+	// apply holds scaleMu for its whole read-compute-write, so taking it here
+	// means this commit lands strictly before or strictly after a scale
+	// decision, never between one's read and its write.
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	if !s.state.lastPush.IsZero() {
+		// A webhook got here first and pushed a value derived from real work.
+		// The pre-boot count is stale next to that; adopting it would let a
+		// later decision shrink under the job it just scaled up for.
+		log.Printf("floor seed discarded: a scale decision already set the floor to %d", s.state.applied)
+		return
+	}
+	s.state.applied = floor
+	if floor < s.state.bootFloor {
+		// Refine the conservative cap-width boot floor down to what the fleet
+		// actually is. Never upward: the cap is already the safe over-estimate.
+		s.state.bootFloor = floor
+	}
+	// Deliberately does not say "from Railway": floor is the cap fallback when
+	// the read failed, and seedFloor has already logged a WARN in that case.
+	log.Printf("replica floor seeded at %d (boot floor holds until %s)",
+		floor, s.state.bootFloorUntil.Format(time.RFC3339))
 }
 
 // railwayClient is the production RailwayClient: it calls Railway's GraphQL
@@ -342,6 +497,40 @@ mutation UpdateReplicas($serviceId: String!, $environmentId: String!, $input: Se
 			"input":         map[string]any{"numReplicas": n},
 		},
 	}, nil)
+}
+
+// Replicas reads the replica count Railway currently has configured for the
+// runner service. Used once at boot to seed the floor; the same project-scoped
+// token that authorises SetReplicas can read this, so it needs no extra
+// credential.
+func (c *railwayClient) Replicas(ctx context.Context) (int, error) {
+	const query = `
+query Replicas($serviceId: String!, $environmentId: String!) {
+  serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
+    numReplicas
+  }
+}`
+	var out struct {
+		ServiceInstance struct {
+			NumReplicas *int `json:"numReplicas"`
+		} `json:"serviceInstance"`
+	}
+	err := c.gqlDo(ctx, gqlRequest{
+		Query: query,
+		Variables: map[string]any{
+			"serviceId":     c.serviceID,
+			"environmentId": c.environmentID,
+		},
+	}, &out)
+	if err != nil {
+		return 0, err
+	}
+	if out.ServiceInstance.NumReplicas == nil {
+		// Railway reports null for a service with no replica override. Treat it
+		// as unknown rather than as zero, which would read as "idle fleet".
+		return 0, fmt.Errorf("railway reported no numReplicas for service %s", c.serviceID)
+	}
+	return *out.ServiceInstance.NumReplicas, nil
 }
 
 func (c *railwayClient) gqlDo(ctx context.Context, req gqlRequest, out any) error {

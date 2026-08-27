@@ -20,6 +20,8 @@ type fakeRailwayClient struct {
 	mu            sync.Mutex
 	calls         []int
 	err           error
+	replicas      int           // what Railway reports at boot, seeding the floor
+	replicasErr   error         // simulate a failed boot read
 	delay         time.Duration // artificial in-call delay, to widen the overlap window
 	respectCtx    bool          // honor ctx cancellation, as the real client does
 	concurrent    int           // appliers currently inside SetReplicas
@@ -54,6 +56,22 @@ func (f *fakeRailwayClient) SetReplicas(ctx context.Context, n int) error {
 	return err
 }
 
+// Replicas reports the fleet size Railway would return at boot. The zero value
+// stands in for an idle fleet, giving the tests that exercise the ramp a floor
+// of 1. Note the production client never returns 0: Railway reports null for a
+// service with no replica override, and railwayClient.Replicas turns that into
+// an error precisely so it is not read as "idle".
+func (f *fakeRailwayClient) Replicas(ctx context.Context) (int, error) {
+	if f.respectCtx {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.replicas, f.replicasErr
+}
+
 func (f *fakeRailwayClient) lastCall() (int, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -84,14 +102,14 @@ func newTestServer(maxRunners int, ttl time.Duration, clock func() time.Time) (*
 			StaleJobTTL:   ttl,
 			RunnerLabels:  []string{"self-hosted", "railway"},
 		},
-		state: &State{
-			queued:     make(map[int64]time.Time),
-			inProgress: make(map[int64]time.Time),
-			completed:  make(map[int64]struct{}),
-		},
+		state:  newState(maxRunners, clock(), ttl),
 		client: client,
 		clock:  clock,
 	}
+	// Mirror production boot exactly: state starts at the cap, then the floor is
+	// refined from what the client reports. Constructing State by hand here is
+	// what let the fixture and production disagree about the floor.
+	srv.seedFloorOnce(context.Background())
 	return srv, client
 }
 
@@ -164,15 +182,12 @@ func TestValidateHMAC(t *testing.T) {
 
 // --- scaling state machine ---
 
-func TestScaleUp_FirstJobUsesBaseReplicaWithoutAPICall(t *testing.T) {
-	srv, client := newTestServer(6, time.Hour, testClock)
-	if err := srv.scaleUp(context.Background(), 1); err != nil {
-		t.Fatalf("scaleUp: %v", err)
-	}
-	if _, ok := client.lastCall(); ok {
-		t.Fatalf("first job should be handled by the base replica with no API call")
-	}
-}
+// The first-job case is covered by
+// TestScaleUp_ColdStartAssertsWithoutShrinkingAPossiblyLiveFleet in
+// deadlock_test.go. It used to assert the opposite — that the first job after
+// boot makes no API call because a base replica is already there — which is the
+// assumption ATT-482 falsified: the fleet had zero live runners and nothing
+// ever asserted a count, so the first job waited forever.
 
 func TestScaleUp_ConcurrentJobsScaleReplicas(t *testing.T) {
 	srv, client := newTestServer(6, time.Hour, testClock)
@@ -190,15 +205,37 @@ func TestScaleUp_ConcurrentJobsScaleReplicas(t *testing.T) {
 }
 
 func TestScaleUp_CapsAtMaxRunners(t *testing.T) {
-	srv, client := newTestServer(2, time.Hour, testClock)
+	now := testClock()
+	clock := func() time.Time { return now }
+	srv, client := newTestServer(2, time.Hour, clock)
 	ctx := context.Background()
-	_ = srv.scaleUp(ctx, 1) // total=1, base replica, no call
-	_ = srv.scaleUp(ctx, 2) // total=2 == max, SetReplicas(2)
-	_ = srv.scaleUp(ctx, 3) // total=3 > max, must NOT call again
+	_ = srv.scaleUp(ctx, 1) // 1 unfinished job  -> 1 replica
+	_ = srv.scaleUp(ctx, 2) // 2 unfinished jobs -> 2 replicas, at the cap
+	_ = srv.scaleUp(ctx, 3) // 3 unfinished jobs -> same value, coalesced
 
 	calls := client.allCalls()
-	if len(calls) != 1 || calls[0] != 2 {
-		t.Fatalf("expected exactly one SetReplicas(2) call once at max runners, got %v", calls)
+	for _, n := range calls {
+		if n > 2 {
+			t.Fatalf("replica count exceeded MaxRunners=2: %v", calls)
+		}
+	}
+	if last := calls[len(calls)-1]; last != 2 {
+		t.Fatalf("expected the fleet held at the cap 2, got %v", calls)
+	}
+
+	// Capping means the fleet is HELD at the cap, not that the service stops
+	// managing it. Once the coalesce window lapses the cap must be re-asserted,
+	// because that push is the only thing that can revive a fleet which lost its
+	// runners while over the cap (ATT-482).
+	now = now.Add(2 * coalesceWindow)
+	before := len(calls)
+	_ = srv.scaleUp(ctx, 4)
+	after := client.allCalls()
+	if len(after) == before {
+		t.Fatalf("over-cap decision past the coalesce window made no call: %v", after)
+	}
+	if last := after[len(after)-1]; last != 2 {
+		t.Fatalf("expected the cap re-asserted at 2, got %v", after)
 	}
 }
 
@@ -510,6 +547,9 @@ func TestReapStaleJobs_DoesNotTouchReplicasWhileOtherJobInProgress(t *testing.T)
 	srv.state.queued[2] = testClock().Add(-2 * time.Hour)
 	srv.state.mu.Unlock()
 
+	// scaleUp(1) legitimately asserted a count already, so the guarantee under
+	// test is that the REAP adds no call of its own.
+	callsBefore := len(client.allCalls())
 	srv.reapStaleJobs(ctx)
 
 	srv.state.mu.Lock()
@@ -522,8 +562,8 @@ func TestReapStaleJobs_DoesNotTouchReplicasWhileOtherJobInProgress(t *testing.T)
 	if !job1Present {
 		t.Fatalf("job 1 is genuinely in progress and must not be reaped")
 	}
-	if _, ok := client.lastCall(); ok {
-		t.Fatalf("reap must not touch replicas while a real job (1) is still in progress")
+	if got := len(client.allCalls()); got != callsBefore {
+		t.Fatalf("reap must not touch replicas while a real job (1) is still in progress, got %d new call(s)", got-callsBefore)
 	}
 }
 
